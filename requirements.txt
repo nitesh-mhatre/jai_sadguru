@@ -1,0 +1,35 @@
+# Core
+requests>=2.28.0
+pandas>=1.5.0
+rich>=13.0.0
+prompt_toolkit>=3.0.0
+openai>=1.0.0
+
+# NSE India — option chain, OI, expiries, charts
+# (uses data/nse_session.py for cookie-based session)
+
+# Yahoo Finance — NIFTY spot (^NSEI), India VIX (^INDIAVIX), historical replay data
+yfinance>=0.2.40
+
+# News feed — Google News via RSS, no API key needed
+gnews>=0.3.7
+
+# Timezone support for NSE market hours
+pytz>=2024.1
+
+# Optional display helpers
+tabulate>=0.9.0
+plotly>=5.0.0
+
+# ── Kronos K-line foundation model (trading/kronos_forecast.py) ──────────────
+# Optional but recommended: candle forecasting for live + simulation modes.
+# 1) pip install torch --index-url https://download.pytorch.org/whl/cpu   (or CUDA wheel)
+# 2) pip install transformers huggingface_hub
+# 3) Clone the repo so `model/` is importable (or pip install kronos if available):
+#       git clone https://github.com/shiyu-coder/Kronos
+#       export PYTHONPATH="$PWD/Kronos:$PYTHONPATH"
+# Weights auto-download from HuggingFace (NeoQuasar/Kronos-small) on first use.
+# Everything degrades gracefully if Kronos is not installed — LLM-only mode.
+# torch>=2.0
+# transformers>=4.40
+# huggingface_hub>=0.23
