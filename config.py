@@ -28,6 +28,13 @@ SIM_DATA_DIR  = APP_DIR / "sim_data"         # downloaded historical data cache
 APP_DIR.mkdir(parents=True, exist_ok=True)
 SIM_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Trading defaults ──────────────────────────────────────────────────────────
+# One NIFTY lot (75 units) at a real premium of ₹100–₹250 costs ₹7,500–₹19,000,
+# so a ₹10,000 simulation budget often cannot fund a single lot and the replay
+# places no orders. /sim therefore defaults to this budget unless the user
+# states one explicitly (e.g. "/sim 3d budget 50000").
+SIM_DEFAULT_BUDGET = 200_000.0
+
 # ── NVIDIA NIM — the only LLM backend ─────────────────────────────────────────
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -42,7 +49,13 @@ NVIDIA_KEYS = {
         "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"),
     "key4": os.environ.get("NVIDIA_API_KEY4",
         "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"),
+    "key5": os.environ.get("NVIDIA_API_KEY5",
+        "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"),
 }
+
+# Request timeout (seconds) is per model — see NVIDIA_MODELS[...]["timeout"].
+# Big reasoning models need far longer than a fast one, so a single global
+# timeout either strangles the slow models or makes fast failures drag.
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 # short_name → {model_id, api_key, max_tokens, temperature, top_p, description}
@@ -50,22 +63,47 @@ NVIDIA_KEYS = {
 
 NVIDIA_MODELS: dict[str, dict] = {
 
-    # ── Default — main reasoning model ────────────────────────────────────────
+    # ── DEFAULT — fastest verified tool-calling model (~0.5–2s per call) ──────
+    # stream=False is REQUIRED: with stream=True + tools this model returns
+    # either HTTP 500 or a stream that never emits a finish chunk (the client
+    # would sit there until the request timeout).
+    "mistral": {
+        "model_id":    "mistralai/mistral-nemotron",
+        "api_key":     NVIDIA_KEYS["key5"],
+        "max_tokens":  4096,
+        "temperature": 0.6,
+        "top_p":       0.7,
+        "stream":      False,
+        "timeout":     90,
+        "description": "Mistral Nemotron — fastest tool-calling model (DEFAULT)",
+    },
+    "nemo-light": {
+        "model_id":    "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "api_key":     NVIDIA_KEYS["key1"],
+        "max_tokens":  4096,
+        "temperature": 0.4,
+        "top_p":       0.9,
+        "timeout":     120,
+        "description": "Nemotron 3.5 Lightning 30B — failover; slow start (~30s)",
+    },
+    "glm-flash": {
+        "model_id":    "z-ai/glm-5.3-flash",
+        "api_key":     NVIDIA_KEYS["key5"],
+        "max_tokens":  16384,
+        "temperature": 0.4,
+        "top_p":       0.9,
+        "stream":      False,
+        "timeout":     150,
+        "description": "Z-AI GLM-5.3 Flash — reliable tool calls, but ~50s per call",
+    },
     "glm": {
         "model_id":    "z-ai/glm-5.3",
         "api_key":     NVIDIA_KEYS["key2"],
         "max_tokens":  16384,
         "temperature": 0.5,
         "top_p":       1.0,
-        "description": "Z-AI GLM-5.3 — primary reasoning + tool-calling (DEFAULT)",
-    },
-    "glm52": {
-        "model_id":    "z-ai/glm-5.2",
-        "api_key":     NVIDIA_KEYS["key2"],
-        "max_tokens":  16384,
-        "temperature": 0.5,
-        "top_p":       1.0,
-        "description": "Z-AI GLM-5.2 — alternate reasoning model",
+        "timeout":     150,
+        "description": "Z-AI GLM-5.3 — deep reasoning, VERY slow (>75s per call)",
     },
     "kimi": {
         "model_id":    "moonshotai/kimi-k3",
@@ -74,55 +112,27 @@ NVIDIA_MODELS: dict[str, dict] = {
         "temperature": 1.0,
         "top_p":       0.95,
         "reasoning_effort": "max",
-        "description": "Moonshot Kimi K3 — deep reasoning with vision support",
-    },
-    "minimax": {
-        "model_id":    "minimaxai/minimax-m2.7",
-        "api_key":     NVIDIA_KEYS["key1"],
-        "max_tokens":  8192,
-        "temperature": 1.0,
-        "top_p":       0.95,
-        "description": "MiniMax M2.7 — long-context trade write-ups",
-    },
-    "nemotron": {
-        "model_id":    "nvidia/nemotron-3-ultra-550b-a55b",
-        "api_key":     NVIDIA_KEYS["key1"],
-        "max_tokens":  8192,
-        "temperature": 0.6,
-        "top_p":       0.95,
-        "description": "NVIDIA Nemotron 3 Ultra 550B — structured analysis",
-    },
-    "nemo-light": {
-        "model_id":    "nvidia/nemotron-3.5-lightning-30b-a3b",
-        "api_key":     NVIDIA_KEYS["key1"],
-        "max_tokens":  4096,
-        "temperature": 0.4,
-        "top_p":       0.9,
-        "description": "Nemotron 3.5 Lightning 30B — fast cycles (live mode default co-analyst)",
-    },
-    "qwen": {
-        "model_id":    "qwen/qwen3-next-80b-a3b-instruct",
-        "api_key":     NVIDIA_KEYS["key4"],
-        "max_tokens":  8192,
-        "temperature": 0.6,
-        "top_p":       0.8,
-        "description": "Qwen3 Next 80B — structured JSON output",
-    },
-    "stepfun": {
-        "model_id":    "stepfun-ai/step-3.5-flash",
-        "api_key":     NVIDIA_KEYS["key4"],
-        "max_tokens":  16384,
-        "temperature": 0.9,
-        "top_p":       0.9,
-        "description": "StepFun Step-3.5 Flash — fast reasoning",
+        "timeout":     150,
+        "description": "Moonshot Kimi K3 — deep reasoning, VERY slow (>75s per call)",
     },
 }
 
 # Models used by the multi-model voting layer (order matters — first is chair)
-VOTING_MODELS = ["glm", "nemo-light", "qwen"]
+VOTING_MODELS = ["mistral", "nemo-light"]
 
-# Default model short name
-NVIDIA_DEFAULT_MODEL = "glm"
+# Default model short name.
+# Live-tested Sep 2026 with key5:
+#   mistral-nemotron   ~0.5–2s, correct tool calls, JSON-clean   ← DEFAULT
+#   glm-5.3-flash      ~50s,       correct tool calls
+#   nemotron-3.5-light ~30s,       correct tool calls (failover)
+#   glm-5.3 / kimi-k3  >75s,       exceeds any sane timeout
+#   RETIRED (HTTP 410 Gone): minimax-m2.7, qwen3-next-80b,
+#                            step-3.5-flash, glm-5.2, kimi-k2.6
+#   nvidia/nemotron-3-super-120b-a12b returns 500/503 constantly
+NVIDIA_DEFAULT_MODEL = "mistral"
+
+# Automatic failover target when the active model errors out
+NVIDIA_FAILOVER_MODEL = "nemo-light"
 
 # Legacy aliases used elsewhere in codebase
 NVIDIA_MODEL       = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["model_id"]
@@ -410,6 +420,31 @@ class Config:
 
 
 # ── Trading / live-mode additions ─────────────────────────────────────────────
+
+# Order management — how an OPEN option order protects profit.
+#
+#   breakeven trigger: once the position has travelled this fraction of the
+#                      distance from entry to target, the stop-loss is moved to
+#                      entry so the trade can no longer turn into a loss.
+#   trail distance   : after that, the stop-loss trails this fraction behind the
+#                      most favourable premium reached, locking in profit.
+#
+# Example (BUY, entry ₹100, target ₹150): at ₹125 (50% of the move) SL → ₹100,
+# then at ₹140 the SL trails to ₹105 (140 × 0.75) and only moves up from there.
+BREAKEVEN_TRIGGER_PCT = 0.50   # fraction of entry→target move before SL → entry
+TRAIL_PCT             = 0.25   # trailing distance behind the best premium
+
+#   partial book     : at PARTIAL_BOOK_TRIGGER of the entry→target move, book
+#                      PARTIAL_BOOK_PCT of the position (T1) and let the rest
+#                      run on the trailing stop. Needs 2+ lots to split — a
+#                      single lot cannot be partially exited.
+#   time exits       : close any order held longer than MAX_HOLD_MINUTES, and
+#                      square everything off at HARD_EXIT_TIME_IST so nothing
+#                      is carried into expiry/gamma risk.
+PARTIAL_BOOK_PCT      = 0.50   # fraction of lots booked at T1 (0 disables)
+PARTIAL_BOOK_TRIGGER  = 0.50   # fraction of entry→target move for the T1 exit
+MAX_HOLD_MINUTES      = 90     # time-based exit when neither SL nor target hits
+HARD_EXIT_TIME_IST    = "15:15"  # square off all intraday option orders (IST)
 
 TRADING_SYSTEM_ADDENDUM = """
 ═══════════════════════════════════════════════════════════════

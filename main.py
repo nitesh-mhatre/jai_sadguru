@@ -23,8 +23,8 @@ Pipeline (both modes):
     /go budget 200000 loss 15 percent every 3 minutes
 
 /sim command — simulation replay:
-    /sim                  → last 3 trading days, 5-minute candles
-    /sim 7d               → last 7 days
+    /sim                  → last 7 days, 5-minute candles, 200-bar sliding window
+    /sim 10d              → last 10 days
     /sim 5d 2024-06-14    → 5 days ending on a specific date
 """
 
@@ -34,6 +34,7 @@ import argparse
 import logging
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -301,7 +302,9 @@ def _run_live_mode(go_text: str, agent: Agent, config: Config,
     trader.start(interval_seconds=params["interval_seconds"])
 
     ui.console.print(
-        "\n  [js.muted]Live mode active. Press [/js.muted][js.accent]Ctrl+C[/js.accent]"
+        "\n  [js.muted]Live option trader active. Option data: [/js.muted]"
+        "[js.accent]Groww chain[/js.accent]  [js.muted]·  Order book refreshes every second. "
+        "Press [/js.muted][js.accent]Ctrl+C[/js.accent]"
         "[js.muted] to stop and return to normal mode.[/js.muted]\n"
     )
 
@@ -309,12 +312,12 @@ def _run_live_mode(go_text: str, agent: Agent, config: Config,
         with Live(
             trader.render_dashboard(),
             console=ui.console,
-            refresh_per_second=0.2,
+            refresh_per_second=2,
             screen=False,
             transient=False,
         ) as live:
             while True:
-                time.sleep(5)
+                time.sleep(1)
                 live.update(trader.render_dashboard())
 
     except KeyboardInterrupt:
@@ -343,12 +346,23 @@ def _run_sim_mode(sim_text: str, agent: Agent, config: Config,
     from trading.sim_mode import SimTrader
 
     parts = sim_text.split() if sim_text else []
-    days  = 3
+    # 7 calendar days ≈ 375 five-minute NIFTY candles, which is enough for the
+    # 200-bar sliding window plus a long run of decisions. Override with
+    # "/sim 10d", "/sim 1m", etc.
+    days  = 7
     for p in parts:
         if p.lower().endswith("d") and p[:-1].isdigit():
             days = int(p[:-1])
 
-    params  = parse_go_command(sim_text)
+    params = parse_go_command(sim_text)
+
+    # A single NIFTY lot at a real premium costs ~₹7.5k–₹19k, so the parser's
+    # ₹10,000 default can fund no trade at all. Use a realistic simulation
+    # budget unless the user stated one explicitly.
+    from config import SIM_DEFAULT_BUDGET
+    if not params.get("budget_explicit"):
+        params["budget"] = SIM_DEFAULT_BUDGET
+
     session = TradingSession(
         budget       = params["budget"],
         max_loss_pct = params["max_loss_pct"],
@@ -376,31 +390,55 @@ def _run_sim_mode(sim_text: str, agent: Agent, config: Config,
             "(pip install torch + clone github.com/shiyu-coder/Kronos to enable)[/yellow]"
         )
 
-    sim = SimTrader(session, agent, config, log_fn=_sim_log,
+    # Logs go to the dashboard panel (log_fn=None) so the Rich Live view stays clean
+    sim = SimTrader(session, agent, config, log_fn=None,
                     expiry=expiry, levels=levels)
     ui.console.print(
-        "\n  [js.muted]Simulation running — press [/js.muted][js.accent]Ctrl+C[/js.accent]"
+        "\n  [js.muted]Simulation running — live order book, votes and data log below. "
+        "Press [/js.muted][js.accent]Ctrl+C[/js.accent]"
         "[js.muted] to stop early.[/js.muted]\n"
     )
+
+    outcome: dict = {}
+
+    def _sim_worker() -> None:
+        try:
+            outcome["result"] = sim.run(days=days)
+        except Exception as exc:            # surfaced after the dashboard closes
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_sim_worker, daemon=True, name="sim-run")
+    worker.start()
+
     try:
-        result = sim.run(days=days)
+        with Live(
+            sim.render_dashboard(),
+            console=ui.console,
+            refresh_per_second=2,
+            screen=False,
+            transient=False,
+        ) as live:
+            while worker.is_alive():
+                live.update(sim.render_dashboard())
+                time.sleep(0.5)
+            live.update(sim.render_dashboard())
     except KeyboardInterrupt:
         sim.stop()
+        worker.join(timeout=10)
         ui.console.print("\n[js.muted]  Simulation stopped early.[/js.muted]\n")
-        result = None
-    except Exception as exc:
-        ui.console.print(f"\n  [red]✗ Simulation failed: {exc}[/red]\n")
+
+    if "error" in outcome:
+        ui.console.print(f"\n  [red]✗ Simulation failed: {outcome['error']}[/red]\n")
         return
 
+    result = outcome.get("result")
     if result:
         _show_sim_summary(result, session)
 
 
 def _sim_log(msg: str, level: str = "INFO") -> None:
-    icon = {"INFO": "·", "OK": "✓", "WARN": "⚠", "ERROR": "✗",
-            "TRADE": "◆", "PLAN": "📋"}.get(level, "·")
-    ts = datetime.now().strftime("%H:%M:%S")
-    ui.console.print(f"  [dim]{ts}[/dim] {icon} {msg}")
+    """Simulation log bridge → shared, colourised backend log renderer."""
+    ui.log_line(msg, level)
 
 
 def _show_sim_summary(result, session) -> None:
@@ -409,7 +447,8 @@ def _show_sim_summary(result, session) -> None:
     t.add_column("Metric", style="bold")
     t.add_column("Value")
     t.add_row("Window", f"{result.days}d · {result.interval} candles")
-    t.add_row("Strikes tracked", ", ".join(str(s) for s in result.strikes))
+    t.add_row("Levels tracked", ", ".join(str(s) for s in result.levels) or "auto")
+    t.add_row("Data source", result.data_source)
     t.add_row("Cycles", str(result.cycles))
     t.add_row("LLM direction accuracy", f"{result.llm_correct}/{result.llm_total}")
     t.add_row("Kronos agreement", f"{result.kronos_agree}/{result.kronos_total}")
@@ -657,11 +696,15 @@ def run(config: Config, start_mode: str = "chat") -> None:
         with ui.console.status("[dim]Fetching option chain snapshot…[/dim]", spinner="dots2"):
             snap = get_option_chain_snapshot(expiry)
         levels = _choose_levels(float(snap.get("spot") or 0))
+        # Show the CURRENT NIFTY value + the current premium/OI/IV of every
+        # chosen level before the mode starts, so the user can see what they
+        # are about to trade (refresh any time with /levels).
+        ui.show_market_now(expiry, levels, title="Your tracked levels — current values")
         if mode == "live":
             _run_live_mode("budget is 100000 and loss taking capacity is 10 percent only",
                            agent, config, expiry=expiry, levels=levels)
         else:
-            _run_sim_mode("3d", agent, config, expiry=expiry, levels=levels)
+            _run_sim_mode("7d", agent, config, expiry=expiry, levels=levels)
 
     while True:
         try:
@@ -677,6 +720,12 @@ def run(config: Config, start_mode: str = "chat") -> None:
         # ── /sim — simulation mode ─────────────────────────────────────────────
         if raw.lower().startswith("/sim"):
             _run_sim_mode(raw[4:].strip(), agent, config)
+            continue
+
+        # ── /levels — refresh current NIFTY value + level premiums ────────────
+        if raw.lower().startswith("/levels") or raw.lower() in ("/nifty", "/spot"):
+            ui.show_market_now(expiry, levels,
+                               title="Your tracked levels — current values")
             continue
 
         # ── /passive — passive pre-planned trading mode ────────────────────────
@@ -853,12 +902,12 @@ def _run_passive_mode(passive_text: str, agent, config) -> None:
         with Live(
             trader.render_dashboard(),
             console=ui.console,
-            refresh_per_second=0.2,
+            refresh_per_second=2,
             screen=False,
             transient=False,
         ) as live:
             while True:
-                time.sleep(5)
+                time.sleep(1)
                 live.update(trader.render_dashboard())
     except KeyboardInterrupt:
         pass
@@ -882,9 +931,8 @@ Modes:
   /go only sell budget 50000 loss 5 percent every 3 minutes
 
 /sim examples (simulation replay):
-  /sim           → last 3 trading days
-  /sim 7d        → last 7 days
-  /sim 5d        → 5 days, learns into rule.md
+  /sim           → last 7 days, sliding 200-bar window, learns into rule.md
+  /sim 15d       → last 15 days (longest runs, most decisions)
 
 NVIDIA NIM models (--nvidia <short> or /models in chat):
   glm        ← default (z-ai/glm-5.3)

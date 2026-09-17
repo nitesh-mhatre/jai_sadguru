@@ -133,18 +133,30 @@ class NvidiaClient:
 
     def __init__(self, model: str, temperature: float, top_p: float,
                  max_tokens: int, api_key: str = "",
-                 reasoning_effort: str | None = None):
+                 reasoning_effort: str | None = None,
+                 timeout: float | None = None,
+                 stream: bool = True):
         self.model       = model
         self.temperature = temperature
         self.top_p       = top_p
         self.max_tokens  = max_tokens
         self.reasoning_effort = reasoning_effort
+        # Streaming is the default because non-streaming made the CLI look
+        # frozen. Some models, however, break on stream=True + tools (mistral-
+        # nemotron answers 500, others never emit a finish chunk), so the model
+        # entry can turn it off. See config.NVIDIA_MODELS.
+        self.stream      = stream
         self.on_token = None            # optional callback(delta_text) for live UI
         _key = api_key or "nvapi-SET-NVIDIA_API_KEY"
+        # Per-model timeout: a slow reasoning model needs a long budget, while a
+        # fast one should surface a failure quickly. A single global value meant
+        # glm-5.3 (needs >75s) ALWAYS blew the 45s cap — the "glm unavailable"
+        # error users saw.
+        self.timeout = float(timeout or REQUEST_TIMEOUT)
         self._client = _OpenAI(
             base_url=NVIDIA_BASE_URL,
             api_key=_key,
-            timeout=REQUEST_TIMEOUT,
+            timeout=self.timeout,
             max_retries=1,   # 1 retry only — 2 retries made failures take minutes
         )
 
@@ -181,6 +193,11 @@ class NvidiaClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
+        # Models flagged stream=False skip the streaming path entirely.
+        if not self.stream:
+            kwargs["stream"] = False
+            return self._chat_once(kwargs)
+
         def _create(kw: dict):
             return self._client.chat.completions.create(**kw)
 
@@ -199,6 +216,65 @@ class NvidiaClient:
             else:
                 raise
 
+        # Stream opened — consume it, but never let a broken stream kill the
+        # turn: some NIM models accept stream=True and then go silent.
+        try:
+            return self._consume_stream(stream)
+        except Exception as exc:
+            log.warning("stream consumption failed (%s) — retrying non-streaming",
+                        str(exc)[:90])
+            return self._chat_once({**kwargs, "stream": False})
+
+    def _chat_once(self, kwargs: dict) -> dict:
+        """
+        Non-streaming call — used when streaming is disabled or fails.
+        Returns the same response envelope as the streaming path.
+        """
+        kw = dict(kwargs)
+        kw["stream"] = False
+        try:
+            resp = self._client.chat.completions.create(**kw)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("temperature", "top_p", "top-p", "unsupported")):
+                kw.pop("temperature", None)
+                kw.pop("top_p", None)
+                resp = self._client.chat.completions.create(**kw)
+            elif "reasoning_effort" in msg:
+                kw.pop("reasoning_effort", None)
+                resp = self._client.chat.completions.create(**kw)
+            else:
+                raise
+
+        msg        = resp.choices[0].message
+        tool_calls: list[dict] = []
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            fn   = getattr(tc, "function", None)
+            args = getattr(fn, "arguments", "") if fn else ""
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            tool_calls.append({
+                "id":       getattr(tc, "id", None) or f"call_{len(tool_calls)}",
+                "type":     "function",
+                "function": {
+                    "name":      getattr(fn, "name", "") if fn else "",
+                    "arguments": args if isinstance(args, dict) else {},
+                },
+            })
+        return {
+            "message": {
+                "role":       "assistant",
+                "content":    getattr(msg, "content", "") or "",
+                "tool_calls": tool_calls,
+            },
+            "done": True,
+        }
+
+    def _consume_stream(self, stream) -> dict:
+        """Read an SSE stream into the standard response envelope."""
         # ── Consume the stream ────────────────────────────────────────────
         content = ""
         tool_calls_raw: dict[int, dict] = {}
@@ -290,6 +366,8 @@ class Agent:
             max_tokens  = entry["max_tokens"],
             api_key     = entry["api_key"],
             reasoning_effort = entry.get("reasoning_effort"),
+            timeout     = entry.get("timeout"),
+            stream      = entry.get("stream", True),
         )
         self._model_label = short
         self._config = config
@@ -297,25 +375,28 @@ class Agent:
 
     def _switch_to_backup(self) -> bool:
         """
-        Switch the active client to the failover model (nemo-light).
+        Switch the active client to the failover model (NVIDIA_FAILOVER_MODEL).
         Returns True if the switch happened. Only once per Agent instance —
         if the backup also fails, the error surfaces to the user.
         """
         if self._failover_used:
             return False
-        from config import NVIDIA_MODELS
-        backup = NVIDIA_MODELS.get("nemo-light")
+        from config import NVIDIA_MODELS, NVIDIA_FAILOVER_MODEL
+        name   = NVIDIA_FAILOVER_MODEL
+        backup = NVIDIA_MODELS.get(name)
         if not backup or self._client.model == backup["model_id"]:
             return False
-        log.warning("Failing over %s → nemo-light", self._client.model)
+        log.warning("Failing over %s → %s", self._client.model, name)
         self._client = NvidiaClient(
             model       = backup["model_id"],
             temperature = backup["temperature"],
             top_p       = backup["top_p"],
             max_tokens  = backup["max_tokens"],
             api_key     = backup["api_key"],
+            timeout     = backup.get("timeout"),
+            stream      = backup.get("stream", True),
         )
-        self._model_label = "nemo-light (failover)"
+        self._model_label = f"{name} (failover)"
         self._failover_used = True
         return True
 
@@ -365,6 +446,7 @@ class Agent:
 
         active_tools = TOOL_SPECS
         iterations    = 0
+        _empty_retries = 0              # recover dropped/empty model responses
         _tool_history: list[str] = []   # track "tool_name:key_param" for loop detection
 
         while iterations < MAX_TOOL_ITERATIONS:
@@ -386,7 +468,7 @@ class Agent:
                 if retriable and self._switch_to_backup():
                     yield ErrorEvent(
                         message=f"⚠ {self._config.nvidia_model} unavailable "
-                                f"({msg[:80]}) — switching to nemo-light and retrying…"
+                                f"({msg[:80]}) — switching to {self._model_label} and retrying…"
                     )
                     continue   # retry the loop iteration with the backup client
 
@@ -417,6 +499,17 @@ class Agent:
             tool_calls = msg.get("tool_calls", []) or []
 
             log.debug("Response: tool_calls=%d  content_len=%d", len(tool_calls), len(content))
+
+            # ── Empty-response retry ──────────────────────────────────────────
+            # Some NIM models intermittently finish with no content AND no tool
+            # calls (finish_reason='tool_calls' but an empty tool_calls array).
+            # One cheap retry recovers those turns instead of showing a blank
+            # answer.
+            if not tool_calls and not content.strip() and _empty_retries < 2:
+                _empty_retries += 1
+                log.warning("Empty response — retrying (%d/2)", _empty_retries)
+                iterations -= 1          # do not spend the tool-call budget on it
+                continue
 
             # ── Handle tool calls ──────────────────────────────────────────────
             if tool_calls:

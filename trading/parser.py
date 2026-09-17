@@ -26,6 +26,7 @@ def parse_go_command(message: str) -> dict:
     {
         "direction":        "BUY" | "SELL" | "BOTH",
         "budget":           float,   # ₹ amount
+        "budget_explicit":  bool,    # True when a ₹ amount was stated in the text
         "max_loss_pct":     float,   # e.g. 10.0 for 10%
         "interval_seconds": int,     # seconds between agent decisions
     }
@@ -35,6 +36,7 @@ def parse_go_command(message: str) -> dict:
     result: dict = {
         "direction":        "BOTH",
         "budget":           10_000.0,
+        "budget_explicit":  False,
         "max_loss_pct":     20.0,   # conservative default
         "interval_seconds": 120,    # 2 minutes
     }
@@ -59,6 +61,7 @@ def parse_go_command(message: str) -> dict:
         if m:
             val = m.group(1).replace(',', '')
             result["budget"] = float(val)
+            result["budget_explicit"] = True
             break
 
     # ── Max-loss percentage ───────────────────────────────────────────────────

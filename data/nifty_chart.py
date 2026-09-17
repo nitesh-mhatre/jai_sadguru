@@ -23,7 +23,10 @@ import pandas as pd
 import argparse
 import sys
 import json
+import logging
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -57,6 +60,22 @@ def build_identifier(expiry: str, strike: float, option_type: str) -> str:
     return f"OPTIDXNIFTY{expiry_fmt}{option_type.upper()}{strike_fmt}"
 
 
+def _nse_json(url: str) -> dict:
+    """
+    GET an NSE JSON endpoint through the cookie-managed session.
+    NSE returns 403 to plain requests without the browser cookies that
+    data/nse_session.py establishes, so this is the fix for "no chart data".
+    """
+    try:
+        from data.nse_session import nse_get
+        resp = nse_get(url, headers=HEADERS)
+    except Exception as exc:
+        log.debug("NSE session fetch failed (%s) — falling back to requests", exc)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def fetch_chart_data(identifier: str) -> pd.DataFrame:
     """
     Fetch time-series chart data for a given NSE option identifier.
@@ -64,18 +83,15 @@ def fetch_chart_data(identifier: str) -> pd.DataFrame:
     Returns a DataFrame with columns: timestamp, price, volume
     """
     url = CHART_URL.format(identifier=identifier)
-    print(f"  [GET] {url}")
 
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-    raw = response.json()
+    raw = _nse_json(url)
 
     # NSE returns: {"grapData": [[timestamp_ms, price], ...], "volume": [[timestamp_ms, vol], ...]}
     graph_data = raw.get("grapthData", [])  # NSE typo: "grapth" not "graph"
     volume_data = raw.get("volume", [])
 
     if not graph_data:
-        print(f"  [Warning] No chart data returned for {identifier}")
+        log.warning("No chart data returned for %s", identifier)
         return pd.DataFrame()
 
     df_price = pd.DataFrame(graph_data, columns=["timestamp_ms", "price"])

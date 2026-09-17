@@ -12,8 +12,13 @@ Pipeline per cycle (identical code path to live mode):
 
 Data:
   • Index candles from Yahoo (data/groww_feed.fetch_index_candles)
-  • PE/CE premium candles for the USER-SELECTED levels from Groww
-    (falls back to an intrinsic+time-value model when unavailable)
+  • PE/CE premium series for the USER-SELECTED levels, built on the SAME time
+    frame and candle size as the index. Free public sources do not serve
+    per-contract option history (verified: Groww's delayed chart route returns
+    candles only for the FNO/ CASH underlyings, and the NSE option-chart route
+    is cookie-walled), so each level is anchored to its REAL Groww chain quote
+    (ltp / delta / theta) and moved along the index grid by that contract's own
+    delta, then decayed by its own theta.
   • The last candle of each replay window is the "live" candle: only its
     OPEN is final. It is used to validate the previous prediction and is
     never fed to the forecaster.
@@ -23,19 +28,60 @@ At session end the core distils results into rule.md lessons.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import math
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 
-from .engine import Trade, TradingSession
+from .engine import NIFTY_LOT_SIZE, Trade, TradingSession
 
 log = logging.getLogger(__name__)
 
 
 # ── Data download ─────────────────────────────────────────────────────────────
+
+_OHLCV = ["open", "high", "low", "close", "volume"]
+
+
+def _normalise_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guarantee a tz-naive IST DatetimeIndex plus lower-case OHLCV columns.
+
+    yfinance hands the frame back with a RangeIndex after reset_index(), which
+    silently made the replay clock read 1970-01-01 (logged as '01-Jan 00:00').
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in _OHLCV:
+        if c not in out.columns:
+            out[c] = 0.0
+
+    ts_col = next((c for c in ("datetime", "date", "timestamp", "index")
+                   if c in out.columns), None)
+    if ts_col:
+        ts = pd.to_datetime(out[ts_col], errors="coerce")
+        try:
+            if getattr(ts.dt, "tz", None) is not None:
+                ts = ts.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        except Exception:
+            pass
+        out = out.assign(_ts=ts).dropna(subset=["_ts"])
+        out = out.set_index("_ts")
+    elif not isinstance(out.index, pd.DatetimeIndex):
+        raise RuntimeError(
+            "Historical NIFTY data has no recognisable datetime column "
+            f"(got {list(df.columns)})"
+        )
+
+    return out.sort_index()[_OHLCV].astype(float)
+
 
 def download_history(days: int = 7, interval: str = "5m") -> pd.DataFrame:
     """Download past NIFTY index candles (Yahoo via groww_feed)."""
@@ -45,7 +91,136 @@ def download_history(days: int = 7, interval: str = "5m") -> pd.DataFrame:
         raise RuntimeError(
             "No historical NIFTY data returned — check network / try again"
         )
-    return hist
+    return _normalise_index(hist)
+
+
+def _align_premium(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    Put a premium series on the SAME timestamp grid as the NIFTY candles, so
+    both are analysed on one time frame and candle size. Missing candles are
+    forward-filled (the option simply did not trade that minute).
+    """
+    if df is None or df.empty or hist is None or hist.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
+    d = d.dropna(subset=["timestamp"]).sort_values("timestamp")
+    lo, hi = hist.index[0], hist.index[-1]
+    d = d[(d["timestamp"] >= lo) & (d["timestamp"] <= hi)]
+    if d.empty:
+        return pd.DataFrame()
+    src = str(d["source"].iloc[0]) if "source" in d.columns else "live"
+    d = d.set_index("timestamp")
+    d = d[~d.index.duplicated(keep="last")]
+    aligned = d.reindex(hist.index, method="ffill")
+    aligned["close"] = aligned["close"].bfill()
+    aligned = aligned.dropna(subset=["close"])
+    if aligned.empty:
+        return pd.DataFrame()
+    aligned["source"] = src
+    return aligned.reset_index()
+
+
+def _intrinsic(strike: float, spot: float, side: str) -> float:
+    return max(0.0, spot - strike) if side == "CE" else max(0.0, strike - spot)
+
+
+def _anchored_premium_series(strike: int, side: str, hist: pd.DataFrame,
+                             leg: dict) -> pd.DataFrame:
+    """
+    Index-aligned premium series anchored to the REAL Groww chain quote for the
+    selected level. The premium travels with the NIFTY candle grid through the
+    contract's own delta and decays with its own theta, so the replay prices the
+    leg the way the market actually prices it instead of an invented flat vol.
+    """
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+
+    p0    = float(leg.get("ltp") or 0.0)
+    delta = float(leg.get("delta") or 0.0)
+    theta = float(leg.get("theta") or 0.0)
+    if not delta:                       # no greeks → ATM-ish sensitivity
+        delta = 0.5 if side == "CE" else -0.5
+
+    step_min = 0.0
+    if len(hist) > 1:
+        try:
+            step_min = (hist.index[1] - hist.index[0]).total_seconds() / 60.0
+        except Exception:
+            step_min = 0.0
+
+    s0 = float(hist["close"].iloc[0])
+    rows = []
+    for i, (ts, row) in enumerate(hist.iterrows()):
+        spot = float(row["close"])
+        elapsed = i * step_min                      # trading minutes into replay
+        p = p0 + delta * (spot - s0) + theta * (elapsed / 375.0)
+        p = max(p, _intrinsic(strike, spot, side) + 0.05)
+        rows.append({"timestamp": ts, "open": p, "high": p, "low": p,
+                     "close": p, "volume": 0, "source": "groww-anchored"})
+    return pd.DataFrame(rows)
+
+
+def _model_premium_series(strike: int, side: str, hist: pd.DataFrame,
+                          chain_leg: dict | None = None,
+                          base_vol_pts: float = 55.0) -> pd.DataFrame:
+    """
+    Index-aligned premium series on the SAME time frame + candle size as NIFTY.
+
+    Preferred: anchored to the live Groww chain quote (real ltp / delta / theta).
+    Last resort: the BLACK fallback model when the chain has no quote for the leg.
+    """
+    if chain_leg and float(chain_leg.get("ltp") or 0.0) > 0:
+        anchored = _anchored_premium_series(strike, side, hist, chain_leg)
+        if not anchored.empty:
+            return anchored
+
+    rows = []
+    for ts, row in hist.iterrows():
+        spot = float(row["close"])
+        minutes_left = max(1, 375 - _minutes_since_open(ts))
+        p = _fallback_premium(strike, spot, side, minutes_left, base_vol_pts)
+        rows.append({"timestamp": ts, "open": p, "high": p, "low": p,
+                     "close": p, "volume": 0, "source": "model"})
+    return pd.DataFrame(rows)
+
+
+def plan_replay(n: int, window: int | None = None,
+                max_cycles: int | None = None) -> tuple[int, int]:
+    """
+    Replay geometry for a series of `n` candles → (window_bars, decisions).
+
+    The window slides ONE candle per decision, so `decisions = n - window - 1`:
+    the model sees bars 0…window, decides, then bars 1…window+1, decides, and so
+    on until the data ends. A 500-candle download with a 200-bar window gives
+    299 decisions. `max_cycles=None` means "replay everything".
+    """
+    n   = max(3, int(n))
+    win = window or min(SIM_WINDOW_BARS,
+                        max(SIM_MIN_WINDOW_BARS, n - SIM_MIN_DECISIONS))
+    win = max(2, min(int(win), n - 2))
+    total = max(1, n - win - 1)
+    cycles = total if max_cycles is None else max(1, min(int(max_cycles), total))
+    return win, cycles
+
+
+def _chain_snapshot_safe(expiry: str = "") -> dict:
+    """Groww chain snapshot (spot / PCR / walls). Never raises."""
+    try:
+        from data.groww_feed import get_option_chain_snapshot
+        return get_option_chain_snapshot(expiry) or {}
+    except Exception as exc:
+        log.warning("Chain snapshot failed: %s", exc)
+        return {}
+
+
+def _premium_source(df: pd.DataFrame) -> str:
+    try:
+        if df is not None and not df.empty and "source" in df.columns:
+            return str(df["source"].iloc[0])
+    except Exception:
+        pass
+    return "model"
 
 
 def pick_strikes(spot: float, n: int = 4, step: int = 50) -> list[int]:
@@ -78,6 +253,7 @@ class SimCycleRecord:
     decision:     str
     realized_pts: float = 0.0     # actual move seen by next cycle (filled later)
     correct:      bool = False
+    llm_ok:       bool = True     # False when the vote came from a fallback
 
 
 @dataclass
@@ -116,16 +292,31 @@ class SimTrader:
     def __init__(self, session: TradingSession, agent, config,
                  log_fn=None, speed: float | None = None,
                  expiry: str = "", levels: list[dict] | None = None):
+        """See run() for the window/candle-count semantics of the replay."""
         self.session = session
         self.agent   = agent
         self.config  = config
-        self._log_fn = log_fn or (lambda msg, level="INFO": None)
+        self._log_fn = log_fn                # None → logs only buffered for the dashboard
         self.speed   = SIM_SPEED if speed is None else speed
         self._stop   = False
         self.expiry  = expiry
         self.levels  = levels or []          # [{strike:int, side:'CE'|'PE'}]
         self._llm_fail_streak = 0            # bypass LLM when backend is down
         self._resolved_levels: list[tuple[int, str]] = []
+
+        # Dashboard / progress state
+        self._lock      = threading.Lock()
+        self._log_buf: list[str] = []
+        self._phase     = "STARTING"
+        self._days      = 0
+        self._interval  = "5m"
+        self._max_cycles = 60
+        self._data_source = ""
+        self._window      = SIM_WINDOW_BARS
+        self._premium_sources: dict[str, str] = {}
+        self._level_quotes: dict[tuple[int, str], dict] = {}
+        self._chain_spot = 0.0
+        self._chain_snap: dict = {}       # live chain snapshot for the market strip
 
         self.records: list[SimCycleRecord] = []
         self._kronos_agree = 0
@@ -138,23 +329,71 @@ class SimTrader:
     # ── Control ───────────────────────────────────────────────────────────────
 
     def stop(self):
-        self._stop = True
+        self._stop  = True
+        self._phase = "STOPPING"
+
+    _ICONS = {"INFO": "·", "OK": "✓", "WARN": "⚠", "ERROR": "✗", "TRADE": "◆",
+              "PLAN": "📋", "DATA": "🗄", "AI": "🤖", "RULE": "📖"}
 
     def _log(self, msg: str, level: str = "INFO"):
-        self._log_fn(msg, level)
+        icon = self._ICONS.get(level, "·")
+        line = f"[{datetime.now():%H:%M:%S}] {icon} {msg}"
+        with self._lock:
+            self._log_buf.append(line)
+            if len(self._log_buf) > 300:
+                self._log_buf.pop(0)
+        if self._log_fn:
+            self._log_fn(msg, level)
+
+    def get_logs(self) -> list[str]:
+        with self._lock:
+            return list(self._log_buf)
 
     # ── Main run ──────────────────────────────────────────────────────────────
 
     def run(self, days: int = 3, interval: str = "5m",
-            pred_len: int = 3, max_cycles: int = 60) -> SimResult:
-        started = datetime.now()
+            pred_len: int = 3, max_cycles: int | None = None,
+            window: int | None = None) -> SimResult:
+        """
+        Slide a `window`-candle view across the whole downloaded series, one
+        candle at a time, deciding at every step:
 
-        # ── 1. Download index candles ─────────────────────────────────────
-        self._log(f"⬇  Downloading {days}d of NIFTY {interval} index candles…")
-        hist = download_history(days, interval)
+            bars 0 … window        → decision 1
+            bars 1 … window + 1    → decision 2
+            bars 2 … window + 2    → decision 3   … until the data runs out
+
+        `max_cycles=None` (default) replays the ENTIRE series — the old
+        hard-coded 60 cut the run short no matter how much data was downloaded.
+        """
+        started = datetime.now()
+        self._phase        = "RUNNING"
+        self._days         = days
+        self._interval     = interval
+
+        # ── 1. Index candles + Groww chain, fetched IN PARALLEL ───────────
+        #    The index fixes the reference time frame / candle size; the chain
+        #    supplies each level's real quote. Neither depends on the other, so
+        #    both start together instead of serialising two network round-trips.
+        self._log(
+            f"Downloading {days}d of NIFTY {interval} index candles + Groww "
+            f"option chain in parallel…",
+            "DATA",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            hist_fut   = pool.submit(download_history, days, interval)
+            snap_fut   = pool.submit(_chain_snapshot_safe, self.expiry)
+            hist       = hist_fut.result()
+            chain_snap = snap_fut.result()
         if hist.empty:
             raise RuntimeError("Historical download empty")
-        self._log(f"✓ {len(hist)} index candles downloaded", "OK")
+        self._chain_snap = chain_snap or {}
+        self._chain_spot = float(self._chain_snap.get("spot") or 0.0)
+        self._log(
+            f"{len(hist)} NIFTY candles {hist.index[0]:%d-%b %H:%M} → "
+            f"{hist.index[-1]:%d-%b %H:%M} ({interval}) · "
+            f"chain spot ≈ {self._chain_spot:,.0f} · PCR {chain_snap.get('pcr', '—')}",
+            "OK",
+        )
 
         # ── 2. Resolve levels (user-selected or auto) ─────────────────────
         first_spot = float(hist["close"].iloc[0])
@@ -165,31 +404,49 @@ class SimTrader:
             resolved = [(strikes[0], "PE"), (strikes[1], "PE"),
                         (strikes[-2], "CE"), (strikes[-1], "CE")]
         self._resolved_levels = resolved
-        self._log(f"✓ Tracking levels: " + ", ".join(f"{s}{sd}" for s, sd in resolved), "OK")
+        self._log("Tracking levels: " + ", ".join(f"{s}{sd}" for s, sd in resolved), "OK")
 
-        # ── 3. Download PE/CE premium candles for each level ──────────────
-        premium_data = self._download_premiums(resolved, interval)
-        data_source  = "groww" if premium_data else "model-fallback"
+        # ── 3. Premium candles for each level, on the SAME grid as NIFTY ──
+        premium_data = self._download_premiums(resolved, interval, days, hist,
+                                               chain_snap=chain_snap)
+        srcs    = [_premium_source(df) for df in premium_data.values()]
+        live    = sum(1 for s in srcs if s in ("groww", "nse"))
+        anchored = sum(1 for s in srcs if s == "groww-anchored")
+        modeled = len(srcs) - live - anchored
+        data_source = "live" if live else ("groww-anchored" if anchored else "model-fallback")
+        self._data_source = data_source
+        self._log(
+            f"Data ready: {len(hist)} NIFTY candles ({interval}) + "
+            f"{len(premium_data)} level series — {live} live, {anchored} Groww-anchored, "
+            f"{modeled} model · all on the same time frame",
+            "DATA",
+        )
 
-        # ── 4. Replay ─────────────────────────────────────────────────────
-        window   = 60
-        step_min = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}.get(interval, 5)
-        cycle    = 0
+        # ── 4. Replay: slide the window over the whole series, 1 candle/step ──
+        n  = len(hist)
+        win, max_cycles = plan_replay(n, window, max_cycles)
+        self._window     = win
+        self._max_cycles = max_cycles
 
-        for i in range(window, len(hist) - 1):
+        self._log(
+            f"Replay plan: {n} candles · sliding window {win} bars · step 1 "
+            f"candle → {max_cycles} decisions "
+            f"(bars {win}→{win + max_cycles - 1} of {n - 1})",
+            "OK",
+        )
+
+        cycle = 0
+        for i in range(win, n - 1):
             if self._stop or cycle >= max_cycles:
                 break
             cycle += 1
 
             # Replay window: closed candles + the "live" open candle
-            chunk       = hist.iloc[i - window:i + 1]
+            chunk       = hist.iloc[i - win:i + 1]
             past        = chunk.iloc[:-1]
             live_candle = chunk.iloc[-1]
 
-            ts_idx = past.index[-1]
-            now_clock = (pd.Timestamp(ts_idx).to_pydatetime()
-                         if not isinstance(ts_idx, pd.Timestamp)
-                         else ts_idx.to_pydatetime())
+            now_clock = _to_pydatetime(past.index[-1])
 
             spot        = float(live_candle["open"])   # open-candle rule
             closed_spot = float(past["close"].iloc[-1])
@@ -209,7 +466,7 @@ class SimTrader:
             k_vote, k_reason = kronos_vote(kf)
 
             # ── LLM vote (bypassed after 3 straight failures) ─────────────
-            llm_dir, llm_reason = self._llm_vote_safe(
+            llm_dir, llm_reason, llm_ok = self._llm_vote_safe(
                 spot, momentum, kf, now_clock, resolved,
                 premium_data, closed_spot, minutes_left)
 
@@ -223,7 +480,7 @@ class SimTrader:
             rec = SimCycleRecord(
                 cycle=cycle, clock=now_clock, spot=spot,
                 kronos_dir=kf.direction if kf else "N/A",
-                llm_dir=llm_dir, decision=decision,
+                llm_dir=llm_dir, decision=decision, llm_ok=llm_ok,
             )
             self.records.append(rec)
             if self._prev_prediction:
@@ -232,10 +489,21 @@ class SimTrader:
                 "spot": spot, "direction": llm_dir, "record": rec,
             }
 
+            # Make a fallback vote unmistakable: ✗BEARISH* = LLM failed, the
+            # direction came from price momentum — NOT from the model.
+            llm_label = llm_dir if llm_ok else f"✗{llm_dir}*"
+            if not llm_ok and self._llm_fail_streak == 1:
+                self._log(
+                    "LLM unavailable — votes fall back to price momentum "
+                    "(shown with *). Decisions still run, but treat them as "
+                    "momentum-only, not model-backed.",
+                    "WARN",
+                )
             self._log(
-                f"[{now_clock:%d-%b %H:%M}] cycle {cycle}/{max_cycles}  spot={spot:.0f}  "
-                f"Kronos={rec.kronos_dir}  LLM={llm_dir} ({llm_reason[:35]})  → {decision}",
-                "OK",
+                f"cycle {cycle}/{max_cycles} [{now_clock:%d-%b %H:%M}] spot={spot:.0f}  "
+                f"Kronos={rec.kronos_dir}  LLM={llm_label}  → {decision}  "
+                f"({llm_reason[:40]})",
+                "OK" if llm_ok else "WARN",
             )
 
             if self.speed > 0:
@@ -258,26 +526,108 @@ class SimTrader:
         ended  = datetime.now()
         result = self._build_result(started, ended, days, interval, data_source)
         self._learn_rules(result)
+        self._phase = "DONE"
         return result
 
     # ── Premium data download ─────────────────────────────────────────────────
 
-    def _download_premiums(self, resolved: list[tuple[int, str]],
-                           interval: str) -> dict[tuple[int, str], pd.DataFrame]:
-        """Download PE/CE premium candles per level from Groww."""
+    def _download_premiums(self, resolved: list[tuple[int, str]], interval: str,
+                           days: int, hist: pd.DataFrame,
+                           chain_snap: dict | None = None
+                           ) -> dict[tuple[int, str], pd.DataFrame]:
+        """
+        Fetch premium candles for every level IN PARALLEL, then align each series
+        to the NIFTY candle grid (identical time frame + candle size). When a
+        contract has no live history, an index-aligned model series is built so
+        the level still takes part in the analysis instead of silently dropping.
+        """
         from data.groww_feed import fetch_option_candles
         out: dict[tuple[int, str], pd.DataFrame] = {}
-        for strike, side in resolved:
-            if self._stop:
-                break
-            with ui_status(f"Downloading {strike}{side} premiums…"):
-                df = fetch_option_candles(self.expiry, strike, side,
-                                          interval=interval, limit=800)
-            if df is not None and not df.empty:
-                out[(strike, side)] = df
-                self._log(f"✓ {strike}{side}: {len(df)} premium candles", "OK")
+        if not resolved:
+            return out
+
+        # ── Real Groww chain quotes for the selected levels ───────────────
+        # These give the true premium scale (ltp) plus the contract's own
+        # delta/theta/IV/OI — the series every level is anchored to.
+        try:
+            from data.groww_feed import get_quote
+            snap = chain_snap or _chain_snapshot_safe(self.expiry)
+            self._chain_spot = float(snap.get("spot") or 0.0)
+            for s, sd in resolved:
+                q = get_quote(self.expiry, s, sd)
+                if q and float(q.get("ltp") or 0.0) > 0:
+                    self._level_quotes[(s, sd)] = q
+            if self._level_quotes:
+                self._log(
+                    f"Groww chain: spot ≈ {self._chain_spot:,.0f} · "
+                    f"{len(self._level_quotes)}/{len(resolved)} level quotes live "
+                    f"(ltp/OI/IV/delta/theta)",
+                    "DATA",
+                )
             else:
-                self._log(f"⚠ {strike}{side}: no premium data — using model fallback", "WARN")
+                self._log(
+                    "Groww chain returned no quote for the selected levels "
+                    "(expiry may differ from the live chain) — using model grid",
+                    "WARN",
+                )
+        except Exception as exc:
+            self._log(f"Groww chain quotes unavailable — {exc}", "WARN")
+
+        self._log(
+            f"Downloading {len(resolved)} level series in parallel "
+            f"(NIFTY {len(hist)} × {interval} as the reference grid)…",
+            "DATA",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(resolved)) as pool:
+            futures = {
+                pool.submit(fetch_option_candles, self.expiry, s, sd,
+                            interval, 800, days): (s, sd)
+                for s, sd in resolved
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                strike, side = futures[fut]
+                label = f"{strike}{side}"
+                try:
+                    df = fut.result()
+                except Exception as exc:
+                    df = None
+                    self._log(f"{label}: download failed — {exc}", "WARN")
+
+                if df is not None and not df.empty:
+                    aligned = _align_premium(df, hist)
+                    if not aligned.empty:
+                        out[(strike, side)] = aligned
+                        src = _premium_source(aligned)
+                        self._premium_sources[label] = src
+                        self._log(
+                            f"{label}: {len(aligned)} premium candles aligned to the "
+                            f"NIFTY {interval} grid (source={src})",
+                            "OK",
+                        )
+                        continue
+
+                # No free public premium history for the leg → build a series on
+                # the SAME grid, anchored to the real Groww chain quote.
+                leg    = self._level_quotes.get((strike, side))
+                series = _model_premium_series(strike, side, hist, chain_leg=leg)
+                out[(strike, side)] = series
+                src = _premium_source(series)
+                self._premium_sources[label] = src
+                if src == "groww-anchored":
+                    self._log(
+                        f"{label}: {len(series)} candles on the NIFTY {interval} "
+                        f"grid anchored to live Groww quote — ₹{leg.get('ltp'):.1f} "
+                        f"· IV {leg.get('iv', 0):.2f} · delta {leg.get('delta', 0):+.2f} "
+                        f"· OI {int(leg.get('oi') or 0):,}",
+                        "OK",
+                    )
+                else:
+                    self._log(
+                        f"{label}: no live quote/history — built {len(series)}-candle "
+                        f"model series on the NIFTY {interval} grid",
+                        "WARN",
+                    )
         return out
 
     def _premium_at(self, strike: int, side: str, when: datetime,
@@ -319,9 +669,15 @@ class SimTrader:
     # ── LLM vote with fail-streak bypass ──────────────────────────────────────
 
     def _llm_vote_safe(self, spot, momentum, kf, now_clock, resolved,
-                       premium_data, closed_spot, minutes_left) -> tuple[str, str]:
+                       premium_data, closed_spot, minutes_left) -> tuple[str, str, bool]:
+        """
+        Returns (direction, reason, from_llm).
+        from_llm=False means the direction did NOT come from the model — it was
+        derived from price momentum because the LLM was unavailable/unparseable.
+        """
         if self._llm_fail_streak >= 3:
-            return self._fallback_direction(momentum), "LLM bypassed (failing) — momentum-based"
+            return (self._fallback_direction(momentum),
+                    "LLM bypassed (failing) — momentum-based", False)
 
         levels_txt = ", ".join(f"{s}{sd}₹{self._premium_at(s, sd, now_clock, premium_data, closed_spot, minutes_left):.1f}"
                                for s, sd in resolved)
@@ -349,19 +705,21 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
                     d = str(data.get("direction", "")).upper()
                     if d in ("BULLISH", "BEARISH", "SIDEWAYS"):
                         self._llm_fail_streak = 0
-                        return d, str(data.get("reason", ""))[:60]
+                        return d, str(data.get("reason", ""))[:60], True
                     self._llm_fail_streak += 1
-                    return self._fallback_direction(momentum), "unparseable LLM vote — momentum fallback"
+                    return (self._fallback_direction(momentum),
+                            "unparseable LLM vote — momentum fallback", False)
                 elif isinstance(ev, ErrorEvent):
                     self._llm_fail_streak += 1
                     if self._llm_fail_streak == 3:
-                        self._log("⚠ LLM failing repeatedly — switching to momentum-only votes", "WARN")
-                    return self._fallback_direction(momentum), f"LLM error: {ev.message[:40]}"
+                        self._log("LLM failing repeatedly — switching to momentum-only votes", "WARN")
+                    return (self._fallback_direction(momentum),
+                            f"LLM FAILED ({ev.message[:40]}) — momentum fallback", False)
         except Exception as exc:
             self._llm_fail_streak += 1
             log.warning("LLM vote failed: %s", exc)
-            return self._fallback_direction(momentum), "LLM exception"
-        return self._fallback_direction(momentum), "no LLM response"
+            return self._fallback_direction(momentum), f"LLM exception: {exc}", False
+        return self._fallback_direction(momentum), "no LLM response", False
 
     def _fallback_direction(self, momentum: str) -> str:
         m = momentum.lower()
@@ -399,13 +757,30 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
                 continue
             entry = self._premium_at(strike, side, now_clock, premium_data,
                                      spot, minutes_left)
+
+            # Size the position to the session budget — a NIFTY lot at a real
+            # premium (₹100–₹250) costs ₹7.5k–₹19k, so a fixed 1 lot silently
+            # blew past a small budget and the order was rejected with no log.
+            lot_cost = entry * NIFTY_LOT_SIZE
+            avail    = self.session.available_budget
+            qty      = int(avail // lot_cost) if lot_cost > 0 else 0
+            if qty <= 0:
+                self._log(
+                    f"   skip {strike}{side} @ ₹{entry:.1f}: 1 lot = "
+                    f"₹{lot_cost:,.0f} but only ₹{avail:,.0f} available "
+                    f"(raise the /sim budget to trade this level)",
+                    "WARN",
+                )
+                break
+            qty = min(qty, 4)                     # cap position size
+
             trade = Trade(
                 id            = f"S{len(self.session.trades)+1:03d}",
                 expiry        = self.expiry or "SIM",
                 strike        = float(strike),
                 option_type   = side,
                 action        = "BUY",
-                qty           = 1,
+                qty           = qty,
                 entry_price   = entry,
                 current_price = entry,
                 sl            = round(entry * 0.75, 2),
@@ -415,7 +790,9 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
             ok, msg = self.session.add_trade(trade)
             if ok:
                 self.open_orders[key] = {"trade_id": trade.id, "strike": strike, "side": side}
-                self._log(f"   open {trade.id} {strike}{side} @ ₹{entry:.1f}", "TRADE")
+                self._log(f"   open {trade.id} {qty}L {strike}{side} @ ₹{entry:.1f}", "TRADE")
+            else:
+                self._log(f"   order rejected {strike}{side}: {msg}", "WARN")
 
     # ── Result + learning ─────────────────────────────────────────────────────
 
@@ -474,10 +851,133 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
         except Exception as exc:
             log.warning("Rule recording failed: %s", exc)
 
+    # ── Dashboard (Rich Live) ─────────────────────────────────────────────
+
+    def render_dashboard(self):
+        """
+        Continuously-updating simulation view: replay state, the order book
+        (OPEN + CLOSED), per-cycle votes and the backend activity log.
+        """
+        from rich import box as _box
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        import ui
+
+        s    = self.session
+        pnl  = s.total_pnl
+        pc   = "green" if pnl >= 0 else "red"
+        last = self.records[-1] if self.records else None
+
+        header = Table.grid(expand=True, padding=(0, 2))
+        for _ in range(4):
+            header.add_column(ratio=2)
+        header.add_row(
+            Text("🧪 SIMULATION", style="bold color(208)"),
+            Text(f"Phase: {self._phase}", style="bold white"),
+            Text(f"Cycle: {len(self.records)}/{self._max_cycles}", style="cyan"),
+            Text(f"Data: {self._data_source or '—'}", style="dim"),
+        )
+        header.add_row(
+            Text(f"Clock: {last.clock:%d-%b %H:%M}" if last else "Clock: —", style="dim"),
+            Text(f"Spot: {last.spot:,.0f}" if last else "Spot: —", style="dim"),
+            Text(
+                (f"Votes: Kronos={last.kronos_dir} LLM={last.llm_dir}"
+                 + ("" if last.llm_ok else " (fallback)")) if last else "Votes: —",
+                style="dim" if (last and last.llm_ok) else "yellow",
+            ),
+            Text(f"P&L: {'+' if pnl >= 0 else ''}₹{pnl:,.0f}", style=f"bold {pc}"),
+        )
+
+        order_book = ui.render_order_book(
+            s,
+            quote_note=(f"{len(self._premium_sources)} level series · "
+                        f"interval {self._interval} · expiry {self.expiry or '—'}"),
+        )
+
+        # Live reference strip: where NIFTY is NOW and what the tracked levels
+        # cost NOW — alongside the replayed book so the two can be compared.
+        live_levels = [
+            self._level_quotes.get((st, sd),
+                                   {"strike": st, "side": sd, "ltp": 0.0})
+            for st, sd in getattr(self, "_resolved_levels", [])
+        ]
+        market_strip = ui.render_market_strip(
+            self._chain_snap or {"spot": self._chain_spot},
+            live_levels,
+            title="NIFTY now + tracked levels (live, not replayed)",
+        )
+
+        votes = Table(
+            title="[bold cyan]🗳 Cycle Votes (last 10)[/bold cyan]",
+            box=_box.SIMPLE, header_style="bold dim", expand=True,
+        )
+        for col, w in [("Cycle", 6), ("Clock", 14), ("Spot", 9), ("Kronos", 9),
+                       ("LLM", 12), ("Decision", 10), ("Moved", 9), ("OK", 4)]:
+            votes.add_column(col, width=w)
+        for r in self.records[-10:]:
+            lstyle = "dim" if r.llm_ok else "yellow"
+            dstyle = {"BULLISH": "green", "BEARISH": "red"}.get(r.decision, "yellow")
+            votes.add_row(
+                str(r.cycle),
+                f"{r.clock:%d-%b %H:%M}",
+                f"{r.spot:,.0f}",
+                r.kronos_dir,
+                Text(r.llm_dir + ("" if r.llm_ok else " *"), style=lstyle),
+                Text(r.decision, style=dstyle),
+                f"{r.realized_pts:+.0f}" if r.realized_pts else "—",
+                "✓" if r.correct else ("✗" if r.realized_pts else ""),
+            )
+        if not self.records:
+            votes.add_row("—", "—", "—", "—", "[dim]waiting for first cycle[/dim]", "", "", "")
+
+        log_panel = ui.render_log_panel(
+            self.get_logs()[-14:],
+            title="Simulation Activity — data + votes + orders",
+            border_style="dim",
+            subtitle=f"[dim]expiry {self.expiry or '—'} · {self._days}d replay · Ctrl+C to stop[/dim]",
+        )
+
+        return Group(
+            Panel(
+                header,
+                border_style="color(208)",
+                title="[bold color(208)]🙏 Jai Sadguru — Simulation[/bold color(208)]",
+                subtitle=f"[dim]{self._days}d · {self._interval} candles · "
+                         f"levels: {', '.join(k for k in self._premium_sources)}"
+                         + (f" · started {self.records[0].clock:%d-%b %H:%M}"
+                            if self.records else "") + "[/dim]",
+            ),
+            market_strip,
+            order_book,
+            votes,
+            log_panel,
+        )
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 SIM_SPEED = 0.0
+
+# Replay geometry: how many candles the model sees before each decision.
+# The window slides ONE candle per decision, so a 500-candle download with a
+# 200-bar window yields 299 decisions (bars 200→499 and onwards).
+SIM_WINDOW_BARS     = 200
+SIM_MIN_WINDOW_BARS = 30
+SIM_MIN_DECISIONS   = 60     # keep at least this many steps on short downloads
+
+
+def _to_pydatetime(ts) -> datetime:
+    """
+    Convert any pandas index value to datetime WITHOUT the noisy
+    "Discarding nonzero nanoseconds in conversion" UserWarning.
+    """
+    stamp = pd.Timestamp(ts)
+    try:
+        return stamp.to_pydatetime(warn=False)
+    except TypeError:      # older pandas without the warn kwarg
+        return stamp.to_pydatetime()
 
 
 def _minutes_since_open(dt: datetime) -> int:

@@ -48,19 +48,59 @@ JSON action block format:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
 from datetime import datetime, date
 from typing import Optional
 
-from rich import box
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import ui
 from .engine import Trade, TradingSession
+
+log = logging.getLogger(__name__)
+
+try:
+    from config import HARD_EXIT_TIME_IST as HARD_EXIT_TIME
+except Exception:                     # pragma: no cover — defensive
+    HARD_EXIT_TIME = "15:15"
+
+
+def _now_ist_hhmm() -> str:
+    """Current wall clock as 'HH:MM' in IST (falls back to local time)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:%M")
+    except Exception:
+        return datetime.now().strftime("%H:%M")
+
+
+def _opt_float(v) -> Optional[float]:
+    """Optional float from a trade action — None for missing/zero/invalid."""
+    try:
+        f = float(v)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ── Loss → rule.md section mapping ────────────────────────────────────────────
+
+def loss_section(regime: str) -> str:
+    """Map a detected market regime onto the matching rule.md section."""
+    r = (regime or "").upper()
+    if "SIDEWAY" in r or "RANGE" in r:
+        return "REGIME SIDEWAYS"
+    if "VOLATIL" in r:
+        return "REGIME VOLATILE"
+    if any(k in r for k in ("DIRECTION", "TREND", "BULL", "BEAR", "MOMENTUM")):
+        return "REGIME DIRECTIONAL"
+    return "GLOBAL"
 
 
 # ── System prompt injection for live mode ─────────────────────────────────────
@@ -112,6 +152,10 @@ class LiveTrader:
         trader.stop()
     """
 
+    # Open orders are re-priced this often between decision cycles so the
+    # breakeven/trailing stop-loss tracks the market, not the decision cadence.
+    PRICE_REFRESH_SEC = 5
+
     def __init__(self, session: TradingSession, agent, config, log_fn=None,
                  expiry: str = "", levels: list[dict] | None = None):
         self.session  = session
@@ -126,6 +170,15 @@ class LiveTrader:
         self._last_brief = None
         self._recent_decisions: list[str] = []   # last 5 decisions for context
         self._no_action_count: int = 0           # consecutive NO_ACTION counter
+        # Backend diagnostics shown on the dashboard
+        self._last_source  = ""        # "groww" | "nse" — last option-data source
+        self._last_regime  = ""        # last detected market regime
+        self._quote_note   = ""        # live-quote freshness note for the order book
+        self._rules_written = 0        # lessons written to rule.md this session
+        self._groww_greeks: dict = {}  # last IV/delta/theta seen from the Groww chain
+        # Live market strip: current NIFTY value + current premium of each level
+        self._market_snap:   dict = {}
+        self._market_levels: list = []
         # User-selected expiry + levels (from the startup flow)
         self.expiry = expiry
         self.levels = levels or []               # [{strike, side}]
@@ -147,6 +200,9 @@ class LiveTrader:
     def start(self, interval_seconds: int = 120) -> None:
         self.interval = interval_seconds
         self._stop.clear()
+        # Populate the market strip before the dashboard first paints, so the
+        # NIFTY value and level premiums are on screen from second one.
+        self._refresh_market_strip()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="live-trader")
         self._thread.start()
 
@@ -164,13 +220,16 @@ class LiveTrader:
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
+    _ICONS = {"INFO": "·", "OK": "✓", "WARN": "⚠", "ERROR": "✗", "TRADE": "◆",
+              "PLAN": "📋", "DATA": "🗄", "AI": "🤖", "RULE": "📖"}
+
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts   = datetime.now().strftime("%H:%M:%S")
-        icon = {"INFO": "·", "OK": "✓", "WARN": "⚠", "ERROR": "✗", "TRADE": "◆"}.get(level, "·")
+        icon = self._ICONS.get(level, "·")
         line = f"[{ts}] {icon} {msg}"
         with self._lock:
             self._log_buf.append(line)
-            if len(self._log_buf) > 25:
+            if len(self._log_buf) > 250:
                 self._log_buf.pop(0)
 
     def get_logs(self) -> list[str]:
@@ -179,47 +238,199 @@ class LiveTrader:
 
     # ── Price updater ─────────────────────────────────────────────────────────
 
-    def _update_prices(self) -> None:
-        """Refresh LTP for all open positions from NSE live data."""
+    def _live_premium(self, trade: Trade) -> tuple[float, str]:
+        """
+        Latest premium for one contract.
+
+        Groww option chain first — data/groww_feed.get_quote covers every strike
+        from one cached chain fetch (the Groww route already coded in this repo).
+        NSE option chart is the fallback when Groww has no chain for that expiry.
+        """
+        try:
+            from data.groww_feed import get_quote
+            q   = get_quote(trade.expiry, int(trade.strike), trade.option_type)
+            ltp = float(q.get("ltp") or 0.0)
+            if ltp > 0:
+                self._groww_greeks = {
+                    "iv": q.get("iv", 0.0), "delta": q.get("delta", 0.0),
+                    "theta": q.get("theta", 0.0), "oi_change": q.get("oi_change", 0),
+                }
+                return ltp, f"Groww(age={q.get('chain_age_s', '?')}s)"
+        except Exception as exc:
+            log.debug("Groww quote failed for %s: %s", trade.id, exc)
+
+        try:
+            from data.nifty_chart import get_option_chart
+            df = get_option_chart(trade.expiry, trade.strike, trade.option_type)
+            if df is not None and not df.empty:
+                return float(df["price"].iloc[-1]), "NSE-chart"
+        except Exception as exc:
+            log.debug("NSE chart failed for %s: %s", trade.id, exc)
+
+        return 0.0, "no-data"
+
+    def _update_prices(self, quiet: bool = False) -> None:
+        """
+        Refresh CMP + P&L for every open order, manage the stop-loss
+        (breakeven / trailing) and auto-close on SL/target hit.
+
+        quiet=True is used by the fast price ticker: closes and SL moves are
+        still logged, only the per-tick summary line is suppressed.
+        """
         open_trades = self.session.open_trades
         if not open_trades:
             return
 
-        try:
-            from data.nifty_chart import get_option_chart
-        except ImportError:
-            self._log("Chart module unavailable — skipping price update", "WARN")
-            return
+        refreshed, failed = 0, 0
+        sources: set[str] = set()
 
         for trade in open_trades:
-            try:
-                df = get_option_chart(trade.expiry, trade.strike, trade.option_type)
-                if df is not None and not df.empty:
-                    ltp = float(df["price"].iloc[-1])
-                    auto_closed = trade.update_price(ltp)
-                    if auto_closed:
-                        icon = "🎯 TARGET" if trade.status == "TARGET_HIT" else "🛑 SL"
-                        self._log(
-                            f"{icon} hit — {trade.id} {int(trade.strike)}{trade.option_type} "
-                            f"@ ₹{ltp:.1f}  P&L: {'+' if trade.pnl >= 0 else ''}₹{trade.pnl:,.0f}",
-                            "TRADE",
-                        )
-                        # Dataset: record auto-close
-                        self._dataset.on_trade_closed(
-                            trade, trade.status, self._last_brief
-                        )
-                    else:
-                        self._log(
-                            f"Price update {trade.id}: ₹{ltp:.1f}  "
-                            f"P&L: {'+' if trade.pnl >= 0 else ''}₹{trade.pnl:,.0f}",
-                            "OK",
-                        )
-                        # Dataset: record price journey (throttled inside on_price_update)
-                        self._dataset.on_price_update(
-                            trade, ltp, trade.pnl, self._last_brief
-                        )
-            except Exception as exc:
-                self._log(f"Price fetch failed for {trade.id}: {exc}", "ERROR")
+            ltp, src = self._live_premium(trade)
+            if ltp <= 0:
+                failed += 1
+                self._log(
+                    f"No live quote for {trade.id} {int(trade.strike)}{trade.option_type} "
+                    f"— CMP held at ₹{trade.current_price:.1f}",
+                    "WARN",
+                )
+                continue
+
+            refreshed += 1
+            sources.add(src)
+            prev_sl     = trade.sl
+            prev_booked = trade.partial_booked_lots
+            auto_closed = trade.update_price(ltp)
+
+            # Partial profit booked at T1 (price-driven, inside update_price)
+            if trade.partial_booked_lots > prev_booked:
+                lots = trade.partial_booked_lots - prev_booked
+                self._log(
+                    f"💰 PARTIAL BOOK {trade.id} {int(trade.strike)}{trade.option_type}: "
+                    f"{lots}L booked @ ₹{ltp:.1f} — T1 hit · realised "
+                    f"₹{trade.partial_pnl:,.0f} · {trade.remaining_lots}L running "
+                    f"(SL ₹{trade.sl:.1f} {trade.sl_stage})",
+                    "TRADE",
+                )
+
+            if auto_closed:
+                icon = "🎯 TARGET" if trade.status == "TARGET_HIT" else "🛑 SL"
+                self._log(
+                    f"{icon} {trade.id} {int(trade.strike)}{trade.option_type} "
+                    f"closed @ ₹{ltp:.1f} — {trade.close_reason or trade.status} · "
+                    f"P&L {'+' if trade.pnl >= 0 else ''}₹{trade.pnl:,.0f} "
+                    f"({trade.pnl_pct:+.1f}%)  [{src}]",
+                    "TRADE",
+                )
+                self._dataset.on_trade_closed(trade, trade.status, self._last_brief)
+                # Loss → write a lesson into rule.md so it is not repeated
+                if trade.pnl < 0:
+                    self._record_loss_lesson(trade, trade.close_reason or trade.status)
+            else:
+                self._dataset.on_price_update(trade, ltp, trade.pnl, self._last_brief)
+                # Log a stop-loss move (breakeven / trail) so the backend is visible
+                if abs(trade.sl - prev_sl) > 1e-9:
+                    self._log(
+                        f"SL moved {trade.id} {int(trade.strike)}{trade.option_type}: "
+                        f"₹{prev_sl:.1f} → ₹{trade.sl:.1f}  [{trade.sl_stage}] "
+                        f"(best ₹{trade.mfe_price:.1f}, progress {trade.profit_progress*100:.0f}%)",
+                        "OK",
+                    )
+
+        # Keep the live NIFTY value + level premiums fresh on every tick
+        self._refresh_market_strip()
+
+        src_note = ", ".join(sorted(sources)) if sources else "no data"
+        self._quote_note = (
+            f"Quotes: {refreshed}/{len(open_trades)} open orders refreshed · {src_note}"
+        )
+        if not quiet:
+            self._log(
+                f"Quotes refreshed {refreshed}/{len(open_trades)} open orders · {src_note}"
+                + (f" · {failed} failed" if failed else ""),
+                "DATA",
+            )
+
+    def _refresh_market_strip(self) -> None:
+        """
+        Track the CURRENT NIFTY value and the current premium/OI/IV/greeks of
+        every tracked level (Groww chain, TTL-cached so this is cheap).
+        """
+        try:
+            from data.groww_feed import get_levels_snapshot
+            data = get_levels_snapshot(self.expiry, self.levels)
+            self._market_snap   = data.get("snapshot", {}) or {}
+            self._market_levels = data.get("levels", []) or []
+        except Exception as exc:
+            log.debug("Market strip refresh failed: %s", exc)
+
+    def _manage_time_exits(self, now_hhmm: str = "") -> None:
+        """
+        Square off open option orders on time:
+          • orders held longer than `max_hold_minutes`
+          • everything at the hard exit time (default 15:15 IST)
+        Runs on the fast ticker as well as each decision cycle.
+        """
+        if not self.session.open_trades:
+            return
+        now_hhmm = now_hhmm or _now_ist_hhmm()
+        now_ts   = time.time()
+
+        for trade in list(self.session.open_trades):
+            reason = trade.should_time_exit(now_ts, now_hhmm, HARD_EXIT_TIME)
+            if not reason:
+                continue
+            ltp, src   = self._live_premium(trade)
+            exit_price = ltp if ltp > 0 else trade.current_price
+            ok, msg    = self.session.close_trade(trade.id, exit_price)
+            if not ok:
+                self._log(f"Time exit failed for {trade.id}: {msg}", "WARN")
+                continue
+            trade.close_reason = reason
+            self._log(
+                f"⏱ TIME EXIT {trade.id} {int(trade.strike)}{trade.option_type} "
+                f"@ ₹{exit_price:.1f} — {reason} · "
+                f"P&L {'+' if trade.pnl >= 0 else ''}₹{trade.pnl:,.0f} "
+                f"({trade.pnl_pct:+.1f}%)  [{src}]",
+                "TRADE",
+            )
+            self._dataset.on_trade_closed(trade, reason, self._last_brief)
+            if trade.pnl < 0:
+                self._record_loss_lesson(trade, reason)
+
+    def _record_loss_lesson(self, trade: Trade, close_reason: str) -> None:
+        """
+        Persist a loss as a lesson in rule.md so the same mistake is not made
+        again. rule.md is injected into every AI prompt (agent.py), so the next
+        live AND simulation cycle sees it.
+        """
+        try:
+            from trading.rules import record_lessons
+        except Exception as exc:
+            log.warning("rules module unavailable: %s", exc)
+            return
+
+        brief  = self._last_brief
+        regime = self._last_regime or "UNKNOWN"
+        pcr    = getattr(brief, "pcr", 0.0) if brief else 0.0
+        vix    = getattr(brief, "vix", 0.0) if brief else 0.0
+        entry  = trade.entry_price
+        exit_p = trade.exit_price if trade.exit_price is not None else trade.current_price
+
+        lesson = (
+            f"[LIVE LOSS] {int(trade.strike)}{trade.option_type} {trade.action} in "
+            f"{regime} regime (PCR={pcr}, VIX={vix}): entry ₹{entry:.1f} → "
+            f"exit ₹{exit_p:.1f} ({trade.pnl_pct:+.0f}%, {close_reason}). "
+            f"Avoid this setup while the same regime/PCR/VIX conditions are present."
+        )
+        section = loss_section(regime)
+        record_lessons([lesson], section=section,
+                       source_note=f"live {trade.id} loss · {close_reason}")
+        self._rules_written += 1
+        self._log(
+            f"Loss recorded in rule.md → [{section}] ({trade.id}); "
+            f"the AI will see it in every future prompt",
+            "RULE",
+        )
 
     # ── Agent decision cycle ──────────────────────────────────────────────────
 
@@ -249,12 +460,13 @@ class LiveTrader:
             self._ask_agent_for_decision()
             return
 
+        self._last_regime = prediction.regime
         self._log(
-            f"⚡ /next: score={prediction.total_score:.1f}/100  "
+            f"⚡ /next predictor: score={prediction.total_score:.1f}/100  "
             f"regime={prediction.regime}  conf={prediction.confidence}  "
             f"bull={prediction.bull_signals}/bear={prediction.bear_signals}  "
             f"action={prediction.action} {prediction.option_type}",
-            "OK",
+            "AI",
         )
 
         # ── Direction filter ──────────────────────────────────────────────────
@@ -321,7 +533,9 @@ class LiveTrader:
                 current_price = float(act["entry_price"]),
                 sl            = float(act["sl"]),
                 target        = float(act["target"]),
+                partial_target = _opt_float(act.get("partial_target")),
                 rationale     = str(act.get("rationale","")),
+                source        = source or "/next",
             )
         except (KeyError, ValueError, TypeError) as exc:
             self._log(f"Invalid trade params from {source}: {exc}", "ERROR")
@@ -332,11 +546,11 @@ class LiveTrader:
 
         level = "TRADE" if ok else "WARN"
         self._log(
-            f"{source} → {trade_id} "
+            f"{source or 'signal'} → {trade_id} "
             f"{int(trade.strike)}{trade.option_type} {trade.action} "
             f"{trade.qty}L @ ₹{trade.entry_price}  "
-            f"SL ₹{trade.sl}  TGT ₹{trade.target} "
-            + ("✓" if ok else f"✗ {msg}"),
+            f"SL ₹{trade.sl}  TGT ₹{trade.target}"
+            + ("" if ok else f"  — rejected: {msg}"),
             level,
         )
 
@@ -376,12 +590,13 @@ class LiveTrader:
             self._log(f"Scan error: {brief.error}", "ERROR")
             return
 
+        self._last_source = brief.source
         self._log(
-            f"✓ Scan done in {brief.scan_duration_ms}ms  "
+            f"Market scan [{brief.source}] in {brief.scan_duration_ms}ms  "
             f"spot={brief.spot}  ATM={brief.atm}  PCR={brief.pcr}  "
             f"sentiment={brief.sentiment}  "
-            f"strikes scanned: {[f'{t.strike}{t.option_type}' for t in brief.targeted]}",
-            "OK",
+            f"strikes: {[f'{t.strike}{t.option_type}' for t in brief.targeted]}",
+            "DATA",
         )
 
         # ── Step 2: Build compact portfolio state ─────────────────────────────
@@ -389,10 +604,13 @@ class LiveTrader:
         if session.open_trades:
             lines = []
             for t in session.open_trades:
+                booked = (f" T1_booked={t.partial_booked_lots}L/{t.qty}L"
+                          if t.partial_booked_lots else "")
                 lines.append(
                     f"  {t.id} {int(t.strike)}{t.option_type} {t.action} {t.qty}L "
                     f"entry=₹{t.entry_price} CMP=₹{t.current_price} "
-                    f"PnL={t.pnl:+.0f} SL=₹{t.sl} TGT=₹{t.target}"
+                    f"PnL={t.pnl:+.0f} SL=₹{t.sl:.1f}({t.sl_stage}) TGT=₹{t.target}"
+                    f"{booked}"
                 )
             open_pos_summary = "OPEN POSITIONS:\n" + "\n".join(lines)
         else:
@@ -461,6 +679,7 @@ class LiveTrader:
                 pass
             regime = detect_regime(brief, vix, tech_raw)
             regime_block = "\n" + regime.prompt_block()
+            self._last_regime = regime.regime
             self._log(
                 f"📊 Regime: {regime.regime} ({regime.confidence}/4)  "
                 f"Range: {regime.range_low:.0f}–{regime.range_high:.0f}  "
@@ -537,6 +756,7 @@ DECISION CHECKLIST:
 4. If VOLATILE  → buy options wide SL, not sell
 5. R:R ≥ 1:1.5 for buys. For sells: target = collect 50% premium, SL = premium doubles.
 6. If a KRONOS FORECAST block is present, treat it as ONE vote — agree = confidence up, disagree = explain why you overrule it. Never trade on Kronos alone.
+7. Open orders manage themselves: the stop-loss moves to BREAKEVEN (entry) once 50% of the entry→target move is captured, then TRAILS 25% behind the best premium; at T1 (50% of the move) half the lots are booked and the rest runs; orders are squared off automatically after the max hold time or at 15:15 IST. Do NOT micromanage SL/partials — only CLOSE_TRADE when the thesis is invalidated.
 
 {"RECOVERY MODE — close only." if session.recovery_mode else ""}
 
@@ -615,7 +835,9 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
                         current_price = float(act["entry_price"]),
                         sl            = float(act["sl"]),
                         target        = float(act["target"]),
+                        partial_target = _opt_float(act.get("partial_target")),
                         rationale     = str(act.get("rationale", "")),
+                        source        = "AI",
                     )
                 except (KeyError, ValueError, TypeError) as exc:
                     self._log(f"Invalid PLACE_TRADE params: {exc}", "ERROR")
@@ -627,8 +849,8 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
                 self._log(
                     f"PLACE {trade_id} {int(trade.strike)}{trade.option_type} "
                     f"{trade.action} {trade.qty}L @ ₹{trade.entry_price}  "
-                    f"SL ₹{trade.sl}  TGT ₹{trade.target} — "
-                    + ("✓" if ok else f"✗ {msg}"),
+                    f"SL ₹{trade.sl}  TGT ₹{trade.target}"
+                    + ("" if ok else f"  — rejected: {msg}"),
                     level,
                 )
                 # Dataset: record entry with market context
@@ -661,15 +883,20 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
                 with self._lock:
                     ok, msg = self.session.close_trade(trade_id, exit_price)
                 self._log(
-                    f"CLOSE {trade_id} @ ₹{exit_price}  [{reason}] — "
-                    + ("✓" if ok else f"✗ {msg}"),
+                    f"CLOSE {trade_id} @ ₹{exit_price}  [{reason}]"
+                    + ("" if ok else f"  — {msg}"),
                     "TRADE" if ok else "WARN",
                 )
-                # Dataset: record manual close
+                # Dataset: record manual close + learn from a losing exit
                 if ok and closing_trade:
+                    closing_trade.close_reason = reason or "manual close"
                     self._dataset.on_trade_closed(
                         closing_trade, "MANUAL", self._last_brief
                     )
+                    if closing_trade.pnl < 0:
+                        self._record_loss_lesson(
+                            closing_trade, closing_trade.close_reason
+                        )
 
             elif atype == "NO_ACTION":
                 reason = act.get('reason', 'No signal')
@@ -763,7 +990,8 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
                     # After OM finishes (09:30), fall through to normal cycle
                     continue
 
-                # ── NORMAL SESSION: price refresh + decisions ──────────────
+                # ── NORMAL SESSION: time exits + price refresh + decisions ─
+                self._manage_time_exits(now.strftime("%H:%M"))
                 if self.session.open_trades:
                     self._update_prices()
                 else:
@@ -790,10 +1018,18 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
             except Exception as exc:
                 self._log(f"Loop error: {exc}", "ERROR")
 
-            for _ in range(self.interval):
-                if self._stop.is_set():
-                    break
+            # ── Wait out the decision interval, but keep pricing open orders ──
+            # The stop-loss (breakeven/trailing) must react faster than the
+            # decision cadence, so positions are re-priced every
+            # PRICE_REFRESH_SEC while we wait — quietly, to keep logs readable.
+            waited = 0
+            while waited < self.interval and not self._stop.is_set():
                 time.sleep(1)
+                waited += 1
+                if waited % self.PRICE_REFRESH_SEC == 0:
+                    if self.session.open_trades:
+                        self._update_prices(quiet=True)
+                    self._manage_time_exits()
 
         self._phase = "STOPPED"
         self._log("🛑 Live trading loop ended", "OK")
@@ -829,21 +1065,11 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
         mode_label = "🔴 RECOVERY MODE" if s.recovery_mode else "🟢 LIVE TRADING"
         phase_style = "bold red" if s.recovery_mode else "bold green"
 
-        # Last /next prediction info
-        last_next = ""
-        for d in reversed(self._recent_decisions):
-            if d.startswith("/next:"):
-                parts = d.split(":")
-                last_next = f"  ⚡ last: {parts[1] if len(parts)>1 else '?'}"
-                break
-
         header = Table.grid(expand=True, padding=(0, 2))
-        header.add_column(ratio=2)
-        header.add_column(ratio=2)
-        header.add_column(ratio=2)
-        header.add_column(ratio=2)
+        for _ in range(4):
+            header.add_column(ratio=2)
         header.add_row(
-            Text(mode_label + last_next,  style=phase_style),
+            Text(mode_label, style=phase_style),
             Text(f"Budget: ₹{s.budget:,.0f}", style="bold white"),
             Text(f"Max Loss: {s.max_loss_pct}%  (₹{s.max_loss_amount:,.0f})", style="yellow"),
             Text(f"NSE {mkt_label}  {mkt_detail}{gift_line}", style=mkt_style),
@@ -851,127 +1077,56 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
 
         # ── P&L summary ───────────────────────────────────────────────────────
         pnl_row = Table.grid(expand=True, padding=(0, 3))
-        pnl_row.add_column(ratio=3)
-        pnl_row.add_column(ratio=2)
-        pnl_row.add_column(ratio=2)
-        pnl_row.add_column(ratio=3)
+        for _ in range(4):
+            pnl_row.add_column(ratio=3)
         unreal_sign = "+" if s.unrealized_pnl >= 0 else ""
         real_sign   = "+" if s.realized_pnl   >= 0 else ""
         pnl_row.add_row(
             Text(f"Total P&L: {pnl_sign}₹{s.total_pnl:,.0f}  ({pnl_sign}{pnl_pct:.2f}%)",
                  style=f"bold {pnl_color}"),
-            Text(f"Unreal: {unreal_sign}₹{s.unrealized_pnl:,.0f}", style="dim"),
+            Text(f"Unrealised: {unreal_sign}₹{s.unrealized_pnl:,.0f}", style="dim"),
             Text(f"Realised: {real_sign}₹{s.realized_pnl:,.0f}", style="dim"),
             Text(
-                f"Trades: {len(s.trades)} total  |  "
-                f"{len(s.open_trades)} open  |  "
-                f"{len(s.closed_trades)} closed  |  "
-                f"Win-rate: {s.win_rate}%",
+                f"Orders: {len(s.trades)}  |  {len(s.open_trades)} open  |  "
+                f"{len(s.closed_trades)} closed  |  Win-rate {s.win_rate}%",
                 style="dim",
             ),
         )
 
-        # ── Active trades table ───────────────────────────────────────────────
-        active = Table(
-            title="[bold cyan]📊 Active Trades[/bold cyan]",
-            box=box.SIMPLE_HEAVY,
-            header_style="bold cyan",
-            border_style="color(208)",
-            expand=True,
-            show_lines=False,
-        )
-        for col, w in [
-            ("ID",6), ("Expiry",12), ("Strike",8), ("Opt",5),
-            ("Act",6), ("Lots",5), ("Entry",9), ("CMP",9),
-            ("P&L (₹)",14), ("SL",8), ("Target",8),
-        ]:
-            active.add_column(col, width=w)
+        # ── Order book — one table, OPEN orders first then CLOSED, live P&L ────
+        order_book = ui.render_order_book(s, quote_note=self._quote_note)
 
-        for t in s.open_trades:
-            ps = "+" if t.pnl >= 0 else ""
-            pc = "green" if t.pnl >= 0 else "red"
-            active.add_row(
-                t.id,
-                t.expiry,
-                str(int(t.strike)),
-                t.option_type,
-                Text(t.action, style="green" if t.action == "BUY" else "red"),
-                str(t.qty),
-                f"₹{t.entry_price:.1f}",
-                f"₹{t.current_price:.1f}",
-                Text(f"{ps}₹{t.pnl:,.0f} ({ps}{t.pnl_pct:.1f}%)", style=f"bold {pc}"),
-                f"₹{t.sl:.1f}",
-                f"₹{t.target:.1f}",
-            )
-
-        if not s.open_trades:
-            active.add_row("[dim]—[/dim]", "", "", "", "", "", "", "", "[dim]No active trades[/dim]", "", "")
-
-        # ── Closed trades table ───────────────────────────────────────────────
-        closed = Table(
-            title="[bold]✅ Closed Trades (last 10)[/bold]",
-            box=box.SIMPLE,
-            header_style="bold dim",
-            expand=True,
-        )
-        for col, w in [
-            ("ID",6), ("Strike",8), ("Opt",5), ("Act",6),
-            ("Entry",9), ("Exit",9), ("P&L (₹)",14), ("Status",12),
-        ]:
-            closed.add_column(col, width=w)
-
-        closed_sorted = sorted(
-            s.closed_trades,
-            key=lambda t: t.exit_time or datetime.now(),
-            reverse=True,
-        )[:10]
-
-        for t in closed_sorted:
-            ps  = "+" if t.pnl >= 0 else ""
-            pc  = "green" if t.pnl >= 0 else "red"
-            sc  = {"TARGET_HIT": "green", "SL_HIT": "red"}.get(t.status, "dim")
-            closed.add_row(
-                t.id,
-                str(int(t.strike)),
-                t.option_type,
-                t.action,
-                f"₹{t.entry_price:.1f}",
-                f"₹{(t.exit_price or 0):.1f}",
-                Text(f"{ps}₹{t.pnl:,.0f} ({ps}{t.pnl_pct:.1f}%)", style=f"bold {pc}"),
-                Text(t.status, style=sc),
-            )
-
-        if not closed_sorted:
-            closed.add_row("[dim]—[/dim]", "", "", "", "", "", "[dim]No closed trades yet[/dim]", "")
-
-        # ── Activity log ──────────────────────────────────────────────────────
-        logs      = self.get_logs()[-10:]
-        log_lines = "\n".join(logs) if logs else "[dim]Waiting for first decision…[/dim]"
-
-        # Time to next decision
+        # ── Backend activity log ──────────────────────────────────────────────
         if s.last_decision_time:
             elapsed   = int((datetime.now() - s.last_decision_time).total_seconds())
             remaining = max(0, self.interval - elapsed)
-            next_note = f"  [dim cyan]Next decision in {remaining}s  |  Cycle #{s.decision_count}[/dim cyan]"
+            next_note = (
+                f"next decision in {remaining}s · cycle #{s.decision_count} · "
+                f"data source: {self._last_source or 'groww'} · "
+                f"regime: {self._last_regime or '—'} · "
+                f"rule.md lessons written: {self._rules_written}"
+            )
         else:
-            next_note = "  [dim]First decision pending…[/dim]"
+            next_note = "first decision pending · option data: Groww chain"
 
-        log_panel = Panel(
-            log_lines + "\n" + next_note,
-            title="[dim]Activity Log[/dim]",
+        log_panel = ui.render_log_panel(
+            self.get_logs()[-16:],
+            title="Backend Activity — what the engine is doing",
             border_style="dim",
-            padding=(0, 1),
+            subtitle=f"[dim]{next_note}[/dim]",
         )
 
         # ── Assemble ──────────────────────────────────────────────────────────
         return Group(
             Panel(header,  border_style="color(208)", padding=(0, 1),
-                  title=f"[bold color(208)]🙏 Jai Sadguru — Live Trading Mode[/bold color(208)]",
+                  title="[bold color(208)]🙏 Jai Sadguru — Live Option Trader[/bold color(208)]",
                   subtitle=f"[dim]Started {s.start_time.strftime('%H:%M:%S')}  ·  "
-                           f"Press Ctrl+C to exit live mode  ·  "
+                           f"NIFTY F&O · option data via Groww chain  ·  "
+                           f"Ctrl+C to exit  ·  "
                            f"Dataset: {self._dataset.dataset_path}[/dim]"),
             Panel(pnl_row, border_style=pnl_color, padding=(0, 1)),
-            active,
-            closed,
+            ui.render_market_strip(self._market_snap, self._market_levels,
+                                   title="NIFTY now + tracked levels"),
+            order_book,
             log_panel,
         )

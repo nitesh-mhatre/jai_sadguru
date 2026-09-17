@@ -315,6 +315,7 @@ def show_help() -> None:
         ("/r1",                                 "🧠 R1 behavioural scanner — psychology + candle patterns"),
         ("/next",                               "⚡ Instant prediction — calc + Kronos + AI forecast"),
         ("/models",                             "List all available NVIDIA NIM models"),
+        ("/levels",                             "🎯 Current NIFTY value + live premium of tracked levels"),
         ("/rules",                              "📖 View/consolidate learned rules (rule.md)"),
         ("/clear",                              "Clear conversation history"),
         ("/expiries",                           "List all upcoming NIFTY expiry dates"),
@@ -327,8 +328,8 @@ def show_help() -> None:
         ("/go budget 100000 loss 10 percent",   "Both sides, ₹1L, 10% max loss"),
         ("/go only sell budget 50000 loss 5%",  "Live mode, SELL only, ₹50k, 5% stop"),
         ("─── Simulation ───",                  ""),
-        ("/sim",                                "🧪 Replay last 3 days, learn into rule.md"),
-        ("/sim 7d",                             "Replay 7 days of NIFTY candles"),
+        ("/sim",                                "🧪 Replay last 7 days, sliding 200-bar window"),
+        ("/sim 15d",                            "Replay 15 days — longest run, most decisions"),
         ("─── Example Queries ───",             ""),
         ("Where is Nifty right now?",           "Live spot price"),
         ("Show me the option chain",            "Full chain for nearest expiry"),
@@ -417,6 +418,250 @@ def separator() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Live trading UI additions
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Backend log levels → icon + colour. Kept in one place so every mode (live,
+# simulation, passive) renders activity logs identically.
+_LOG_ICONS = {
+    "INFO": "·", "OK": "✓", "WARN": "⚠", "ERROR": "✗",
+    "TRADE": "◆", "PLAN": "📋", "DATA": "🗄", "AI": "🤖", "RULE": "📖",
+}
+_LOG_STYLES = {
+    "INFO": "js.muted", "OK": "js.ok", "WARN": "js.warn", "ERROR": "js.err",
+    "TRADE": "js.accent", "PLAN": "color(208)", "DATA": "cyan", "AI": "magenta",
+    "RULE": "bold yellow",
+}
+_LEAD_ICONS = "✓⚠✗◆📋🗄🤖📖⬇▲▼·"
+
+
+def log_line(msg: str, level: str = "INFO") -> None:
+    """
+    Print one backend activity line: `HH:MM:SS  ◆ message`.
+    If the message already starts with an icon, that icon is kept instead of
+    the level icon — this is what previously produced doubled icons like
+    "✓ ✓ 150 candles".
+    """
+    ts   = _ts()
+    body = str(msg).lstrip()
+    icon = _LOG_ICONS.get(level, "·")
+    if body[:1] in _LEAD_ICONS and (len(body) == 1 or body[1] == " "):
+        console.print(f"  [dim]{ts}[/dim] {escape(body)}")
+    else:
+        style = _LOG_STYLES.get(level, "js.muted")
+        console.print(f"  [dim]{ts}[/dim] [{style}]{icon}[/{style}] {escape(body)}")
+
+
+def render_log_panel(logs: list[str], title: str = "Backend Activity",
+                     border_style: str = "dim", subtitle: str = "") -> Panel:
+    """Colourised activity-log panel for the Rich Live dashboards."""
+    rendered: list[str] = []
+    for line in logs:
+        s     = str(line)
+        style = "js.muted"
+        for lvl, icon in _LOG_ICONS.items():
+            if f"] {icon} " in s:
+                style = _LOG_STYLES.get(lvl, "js.muted")
+                break
+        rendered.append(f"[{style}]{escape(s)}[/{style}]")
+    body = "\n".join(rendered) if rendered else "[dim]Waiting for first cycle…[/dim]"
+    return Panel(body, title=f"[dim]{title}[/dim]", border_style=border_style,
+                 padding=(0, 1), subtitle=subtitle or None)
+
+
+def render_order_book(session, quote_note: str = "", max_closed: int = 40) -> Table:
+    """
+    One continuously-updating order book: every OPEN order first, then the
+    CLOSED orders newest-first — with live P&L per open position.
+    """
+    tbl = Table(
+        title="[bold cyan]📒 Order Book[/bold cyan]  [dim](● open first, then closed)[/dim]",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold cyan",
+        border_style="color(208)",
+        padding=(0, 1),
+        expand=True,
+        show_lines=False,
+    )
+    # Widths are left to Rich: hard-coding 11 widths overflowed a 120-col
+    # terminal, and Rich then collapsed whole columns to '…' — which is exactly
+    # the "table is not printed / unreadable" symptom. Short columns are
+    # no_wrap (they ellipsize only if the console is truly tiny) and the Time
+    # column folds, so the close reason stays visible instead of being cut off.
+    for col, no_wrap in [
+        ("ID", True), ("State", True), ("Contract", True), ("Side", True),
+        ("Lots", True), ("Entry", True), ("CMP", True),
+        ("P&L (₹)", True), ("SL", True), ("TGT", True), ("Time", False),
+    ]:
+        tbl.add_column(col, no_wrap=no_wrap,
+                       overflow="ellipsis" if no_wrap else "fold")
+
+    # Stop-loss stage tags shown next to an open order's SL
+    _sl_tag = {"BREAKEVEN": "BE", "TRAILING": "TS"}
+    # Short state labels so the column never wraps
+    _state = {"OPEN": "● OPEN", "CLOSED": "CLOSED",
+              "SL_HIT": "SL HIT", "TARGET_HIT": "TARGET"}
+    _reason_short = {
+        "trailing": "trail SL", "breakeven": "BE stop", "stop-loss": "SL hit",
+        "hard time": "15:15 exit", "max hold": "max hold", "manual": "manual",
+        "target": "target",
+    }
+
+    def _short_reason(reason: str) -> str:
+        """Compact close reason — the full text is in the log panel."""
+        r = (reason or "").lower()
+        for key, label in _reason_short.items():
+            if key in r:
+                return label
+        return reason[:14]
+
+    def _contract(t) -> str:
+        return f"{int(t.strike)} {t.option_type}"
+
+    for t in sorted(session.open_trades, key=lambda t: t.id):
+        ps = "+" if t.pnl >= 0 else ""
+        pc = "green" if t.pnl >= 0 else "red"
+        tag = _sl_tag.get(getattr(t, "sl_stage", "INITIAL"), "")
+        sl_style = {"BREAKEVEN": "yellow", "TRAILING": "bold green"}.get(
+            getattr(t, "sl_stage", "INITIAL"), ""
+        )
+        # Lots shows remaining/total once a partial (T1) has been booked
+        booked = getattr(t, "partial_booked_lots", 0)
+        lots   = f"{t.remaining_lots}/{t.qty}" if booked else str(t.qty)
+        # Lots already shows remaining/total and the caption explains n/N, so
+        # the time cell stays short enough that the column never wraps.
+        note = f"{t.entry_time:%H:%M} open"
+        tbl.add_row(
+            t.id,
+            Text("● OPEN", style="bold cyan"),
+            _contract(t),
+            Text(t.action, style="green" if t.action == "BUY" else "red"),
+            Text(lots, style="bold yellow" if booked else ""),
+            f"₹{t.entry_price:.1f}",
+            f"₹{t.current_price:.1f}",
+            Text(f"{ps}₹{t.pnl:,.0f} ({ps}{t.pnl_pct:.1f}%)", style=f"bold {pc}"),
+            Text(f"₹{t.sl:.1f}{(' ' + tag) if tag else ''}", style=sl_style),
+            f"₹{t.target:.1f}",
+            note,
+        )
+
+    closed = sorted(
+        session.closed_trades,
+        key=lambda t: t.exit_time or t.entry_time,
+        reverse=True,
+    )[:max_closed]
+    for t in closed:
+        ps = "+" if t.pnl >= 0 else ""
+        pc = "green" if t.pnl >= 0 else "red"
+        state_style = {"TARGET_HIT": "bold green", "SL_HIT": "bold red"}.get(t.status, "dim")
+        exit_t = t.exit_time.strftime("%H:%M") if t.exit_time else "--:--"
+        reason = _short_reason(t.close_reason or t.status.lower())
+        tbl.add_row(
+            t.id,
+            Text(_state.get(t.status, t.status), style=state_style),
+            _contract(t),
+            Text(t.action, style="green" if t.action == "BUY" else "red"),
+            str(t.qty),
+            f"₹{t.entry_price:.1f}",
+            f"₹{(t.exit_price or 0):.1f}",
+            Text(f"{ps}₹{t.pnl:,.0f} ({ps}{t.pnl_pct:.1f}%)", style=f"bold {pc}"),
+            "—",
+            "—",
+            f"{exit_t} · {reason}",
+        )
+
+    if not session.trades:
+        tbl.add_row("[dim]—[/dim]", "[dim]—[/dim]", "[dim]No orders yet[/dim]", "", "",
+                    "", "", "", "", "", "")
+
+    caption = " · ".join(
+        x for x in (quote_note,
+                    "SL: BE=breakeven · TS=trailing",
+                    "Lots n/N = T1 partial booked") if x
+    )
+    tbl.caption = f"[dim]{caption}[/dim]"
+    return tbl
+
+
+def render_market_strip(snap: dict, levels: list | None = None,
+                        title: str = "Live NIFTY market") -> Table:
+    """
+    Compact live strip: current NIFTY value + PCR / max pain / OI walls, then one
+    row per tracked level with its CURRENT premium, OI, IV and greeks.
+    """
+    snap   = snap or {}
+    spot   = float(snap.get("spot") or 0.0)
+    chg    = snap.get("change_pct")
+    age    = snap.get("chain_age_s")
+    source = snap.get("source", "groww")
+
+    head = Table.grid(expand=True, padding=(0, 2))
+    for _ in range(4):
+        head.add_column(ratio=2)
+    spot_txt = f"NIFTY {spot:,.2f}" if spot else "NIFTY —"
+    if chg not in (None, 0):
+        spot_txt += f"  ({float(chg):+.2f}%)"
+    head.add_row(
+        Text(spot_txt, style="bold white"),
+        Text(f"ATM {snap.get('atm') or '—'}  ·  Straddle ₹{snap.get('atm_straddle') or '—'}", style="dim"),
+        Text(f"PCR {snap.get('pcr') or '—'}  ·  Max pain {snap.get('max_pain') or '—'}", style="dim"),
+        Text(
+            f"CE wall {snap.get('ce_wall') or '—'}  ·  PE wall {snap.get('pe_wall') or '—'}"
+            + (f"  ·  {age}s old" if isinstance(age, (int, float)) and age >= 0 else "")
+            + f"  ·  {source}",
+            style="dim",
+        ),
+    )
+
+    rows = Table(box=box.SIMPLE, header_style="bold cyan", expand=True,
+                 padding=(0, 1), title=f"[bold cyan]🎯 {title}[/bold cyan]")
+    for col, no_wrap in [("LEVEL", True), ("CURRENT", True), ("OI", True),
+                         ("OI CHG", True), ("IV", True), ("Delta", True),
+                         ("Theta", True), ("Bias", False)]:
+        rows.add_column(col, no_wrap=no_wrap,
+                        overflow="ellipsis" if no_wrap else "fold")
+
+    for q in (levels or []):
+        ltp = float(q.get("ltp") or 0.0)
+        oic = int(q.get("oi_change") or 0)
+        delta = float(q.get("delta") or 0.0)
+        side  = str(q.get("side", "")).upper()
+        lvl   = f"{q.get('strike')} {side}"
+        # moneyness vs spot, when we know the spot
+        bias = "—"
+        if spot and ltp > 0:
+            itm = (spot > float(q.get("strike") or 0)) if side == "CE" else (spot < float(q.get("strike") or 0))
+            bias = ("ITM" if itm else "OTM") + (" · buyers gaining" if delta and abs(delta) > 0.5 else "")
+        rows.add_row(
+            Text(lvl, style="bold"),
+            Text(f"₹{ltp:,.2f}" if ltp else "—",
+                 style="green" if ltp else "dim"),
+            f"{int(q.get('oi') or 0):,}",
+            Text(f"{oic:+,}", style="yellow" if oic else "dim"),
+            f"{float(q.get('iv') or 0):.2f}" if q.get("iv") else "—",
+            f"{delta:+.2f}" if delta else "—",
+            f"{float(q.get('theta') or 0):+.2f}" if q.get("theta") else "—",
+            Text(bias, style="dim"),
+        )
+    if not (levels or []):
+        rows.add_row("[dim]—[/dim]", "[dim]no levels selected[/dim]", "", "", "", "", "", "")
+
+    return Group(head, rows)
+
+
+def show_market_now(expiry: str = "", levels: list | None = None,
+                    title: str = "Live NIFTY market") -> dict:
+    """Fetch and print the current NIFTY value + live values of tracked levels."""
+    try:
+        from data.groww_feed import get_levels_snapshot
+        data = get_levels_snapshot(expiry, levels)
+    except Exception as exc:
+        console.print(f"  [red]✗ live market fetch failed: {exc}[/red]")
+        return {}
+    console.print()
+    console.print(render_market_strip(data.get("snapshot", {}),
+                                     data.get("levels", []), title=title))
+    console.print()
+    return data
+
 
 def show_go_startup(params: dict, go_text: str) -> None:
     """Show a startup banner when /go is entered."""

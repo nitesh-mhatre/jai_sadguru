@@ -38,6 +38,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import ui
 from trading.engine import Trade, TradingSession, NIFTY_LOT_SIZE
 from trading.passive_planner import PassivePlan, PlannedTrade, PassivePlanner
 
@@ -172,6 +173,9 @@ class PassiveTrader:
                     self._wait(self.interval)
                     continue
 
+                # Time-based square-offs (max hold + hard exit) first
+                self._manage_time_exits()
+
                 # Refresh prices for open positions
                 self._update_open_positions()
 
@@ -288,6 +292,85 @@ class PassiveTrader:
 
     # ── Price updater ──────────────────────────────────────────────────────────
 
+    def _live_premium(self, trade: Trade) -> tuple[float, str]:
+        """Latest premium — Groww chain first, NSE chart fallback."""
+        try:
+            from data.groww_feed import get_quote
+            q = get_quote(trade.expiry, int(trade.strike), trade.option_type)
+            ltp = float(q.get("ltp") or 0.0)
+            if ltp > 0:
+                return ltp, f"Groww(age={q.get('chain_age_s', '?')}s)"
+        except Exception:
+            pass
+        try:
+            from data.nifty_chart import get_option_chart
+            df = get_option_chart(trade.expiry, trade.strike, trade.option_type)
+            if df is not None and not df.empty:
+                return float(df["price"].iloc[-1]), "NSE-chart"
+        except Exception:
+            pass
+        return 0.0, "no-data"
+
+    def _record_loss_lesson(self, trade: Trade, close_reason: str) -> None:
+        """Write a losing exit into rule.md so the setup is avoided next time."""
+        try:
+            from trading.rules import record_lessons
+            from trading.live_mode import loss_section
+        except Exception:
+            return
+        try:
+            with self._lock:
+                plan = self._plan
+            regime = getattr(plan, "overall_bias", "UNKNOWN") or "UNKNOWN"
+            pcr    = getattr(plan, "pcr", 0.0)
+            entry  = trade.entry_price
+            exit_p = trade.exit_price if trade.exit_price is not None else trade.current_price
+            lesson = (
+                f"[PASSIVE LOSS] {int(trade.strike)}{trade.option_type} {trade.action} "
+                f"with plan bias {regime} (PCR={pcr}): entry ₹{entry:.1f} → "
+                f"exit ₹{exit_p:.1f} ({trade.pnl_pct:+.0f}%, {close_reason}). "
+                f"Avoid this planned setup under the same bias/PCR conditions."
+            )
+            section = loss_section(regime)
+            record_lessons([lesson], section=section,
+                           source_note=f"passive {trade.id} loss · {close_reason}")
+            self._log(f"📖 Loss recorded in rule.md → [{section}] ({trade.id})", "PLAN")
+        except Exception as exc:
+            self._log(f"Could not write rule.md lesson: {exc}", "WARN")
+
+    def _manage_time_exits(self) -> None:
+        """Square off open orders on time (max hold / hard exit IST)."""
+        if not self.session.open_trades:
+            return
+        try:
+            from trading.live_mode import HARD_EXIT_TIME, _now_ist_hhmm
+        except Exception:
+            return
+        now_hhmm = _now_ist_hhmm()
+        now_ts   = time.time()
+
+        for trade in list(self.session.open_trades):
+            reason = trade.should_time_exit(now_ts, now_hhmm, HARD_EXIT_TIME)
+            if not reason:
+                continue
+            ltp, src   = self._live_premium(trade)
+            exit_price = ltp if ltp > 0 else trade.current_price
+            ok, msg    = self.session.close_trade(trade.id, exit_price)
+            if not ok:
+                self._log(f"Time exit failed for {trade.id}: {msg}", "WARN")
+                continue
+            trade.close_reason = reason
+            self._log(
+                f"⏱ TIME EXIT {trade.id} {int(trade.strike)}{trade.option_type} "
+                f"@ ₹{exit_price:.1f} — {reason} · "
+                f"P&L {'+' if trade.pnl >= 0 else ''}₹{trade.pnl:,.0f}  [{src}]",
+                "TRADE",
+            )
+            if self._dataset:
+                self._dataset.on_trade_closed(trade, reason, None)
+            if trade.pnl < 0:
+                self._record_loss_lesson(trade, reason)
+
     def _update_open_positions(self) -> None:
         """Refresh LTP for all entered (open) trades."""
         entered_ids = {
@@ -298,40 +381,40 @@ class PassiveTrader:
         if not entered_ids:
             return
 
-        from data.nifty_chart import get_option_chart
-
         for trade in self.session.open_trades:
             if trade.id not in entered_ids:
                 continue
             try:
-                df = get_option_chart(trade.expiry, trade.strike, trade.option_type)
-                if df is not None and not df.empty:
-                    ltp = float(df["price"].iloc[-1])
+                ltp, src = self._live_premium(trade)
+                if ltp <= 0:
+                    continue
 
-                    # Update state LTP
-                    for st in self._states.values():
-                        if st.trade_id == trade.id:
-                            st.ltp = ltp
+                # Update state LTP
+                for st in self._states.values():
+                    if st.trade_id == trade.id:
+                        st.ltp = ltp
 
-                    auto_closed = trade.update_price(ltp)
-                    if auto_closed:
-                        icon = "🎯" if trade.status == "TARGET_HIT" else "🛑"
-                        self._log(
-                            f"{icon} {trade.status}: {trade.id} "
-                            f"@ ₹{ltp:.1f}  P&L={trade.pnl:+.0f}",
-                            "TRADE",
-                        )
-                        if self._dataset:
-                            self._dataset.on_trade_closed(trade, trade.status, None)
-                        # Trigger plan refresh on any close event
-                        self.trigger_refresh(f"{trade.id} {trade.status}")
-                    else:
-                        self._log(
-                            f"Price {trade.id}: ₹{ltp:.1f}  P&L={trade.pnl:+.0f}",
-                            "OK",
-                        )
-                        if self._dataset:
-                            self._dataset.on_price_update(trade, ltp, trade.pnl)
+                auto_closed = trade.update_price(ltp)
+                if auto_closed:
+                    icon = "🎯" if trade.status == "TARGET_HIT" else "🛑"
+                    self._log(
+                        f"{icon} {trade.status}: {trade.id} "
+                        f"@ ₹{ltp:.1f}  P&L={trade.pnl:+.0f}  [{src}]",
+                        "TRADE",
+                    )
+                    if self._dataset:
+                        self._dataset.on_trade_closed(trade, trade.status, None)
+                    if trade.pnl < 0:
+                        self._record_loss_lesson(trade, trade.close_reason or trade.status)
+                    # Trigger plan refresh on any close event
+                    self.trigger_refresh(f"{trade.id} {trade.status}")
+                else:
+                    self._log(
+                        f"Price {trade.id}: ₹{ltp:.1f}  P&L={trade.pnl:+.0f}  [{src}]",
+                        "OK",
+                    )
+                    if self._dataset:
+                        self._dataset.on_price_update(trade, ltp, trade.pnl)
             except Exception as exc:
                 self._log(f"Price update failed {trade.id}: {exc}", "ERROR")
 
@@ -486,7 +569,15 @@ class PassiveTrader:
             self._log(f"PT{pt.id} entry failed: {msg}", "WARN")
 
     def _get_current_ltp(self, pt: PlannedTrade) -> float:
-        """Fetch live LTP for a planned trade."""
+        """Fetch live LTP for a planned trade — Groww chain first."""
+        try:
+            from data.groww_feed import get_quote
+            q = get_quote(pt.expiry, int(pt.strike), pt.option_type)
+            ltp = float(q.get("ltp") or 0.0)
+            if ltp > 0:
+                return round(ltp, 2)
+        except Exception:
+            pass
         try:
             from data.nifty_chart import get_option_chart
             df = get_option_chart(pt.expiry, pt.strike, pt.option_type)
@@ -611,25 +702,27 @@ class PassiveTrader:
             padding=(0, 1),
         )
 
+        # Order book — OPEN orders first, then CLOSED (live P&L)
+        order_book = ui.render_order_book(
+            s, quote_note=f"options priced via Groww chain · plan v{plan.version}"
+        )
+
         # Logs
-        logs      = self.get_logs()[-12:]
-        log_panel = Panel(
-            "\n".join(logs) if logs else "[dim]Starting…[/dim]",
-            title="[dim]Activity Log[/dim]",
-            border_style="dim",
-            padding=(0, 1),
+        log_panel = ui.render_log_panel(
+            self.get_logs()[-14:], title="Backend Activity", border_style="dim"
         )
 
         return Group(
             Panel(
                 header,
                 border_style="color(208)",
-                title="[bold color(208)]🙏 Jai Sadguru — Passive Mode[/bold color(208)]",
+                title="[bold color(208)]🙏 Jai Sadguru — Passive Option Trader[/bold color(208)]",
                 subtitle=f"[dim]Plan created {plan.created_at}  ·  "
                          f"Refresh every 15m  ·  Ctrl+C to exit[/dim]",
             ),
             Panel(pnl_row, border_style=pnl_color, padding=(0,1)),
             plan_tbl,
+            order_book,
             scen_panel,
             log_panel,
         )

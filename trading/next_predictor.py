@@ -125,6 +125,7 @@ class NextTrade:
                     "entry_price": self.entry_price,
                     "sl": self.sl,
                     "target": self.target1,
+                    "partial_target": None,   # single-lot leg — cannot be split
                     "rationale": f"[/next] STRANGLE CE leg. {self.rationale[:120]}",
                 },
                 {
@@ -137,6 +138,7 @@ class NextTrade:
                     "entry_price": self.entry_price_pe,
                     "sl": self.sl_pe,
                     "target": self.target_pe,
+                    "partial_target": None,   # single-lot leg — cannot be split
                     "rationale": f"[/next] STRANGLE PE leg. {self.rationale[:120]}",
                 },
             ]
@@ -150,15 +152,148 @@ class NextTrade:
             "entry_price":  self.entry_price,
             "sl":           self.sl,
             "target":       self.target2,
+            "partial_target": self.target1,   # book half at T1, run the rest to T2
             "rationale":    f"[/next score={self.total_score:.0f} conf={self.confidence}] {self.rationale[:150]}",
-        }]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
+        }]# ══════════════════════════════════════════════════════════════════════════════
 # DATA FETCHERS — run in parallel threads
 # ══════════════════════════════════════════════════════════════════════════════
 
+def option_metrics_from_groww_rows(rows: list[dict], expiry: str = "") -> dict:
+    """
+    Turn Groww chain rows (data/groww_feed.py) into the same metrics dict that
+    `_build_trade` and the signal scorers expect from the NSE chain.
+
+    Pure function (no network) so it can be unit-tested offline.
+    Returns {"error": ...} when the rows are unusable.
+    """
+    if not rows:
+        return {"error": "No option chain data"}
+
+    def _f(v) -> float:
+        try:
+            x = float(v)
+            return 0.0 if (x != x or abs(x) == float("inf")) else x
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _leg(r: dict, side: str) -> dict:
+        return r.get(side.lower(), {}) or {}
+
+    try:
+        rows = sorted(rows, key=lambda r: _f(r.get("strike")))
+        strikes = [int(_f(r.get("strike"))) for r in rows]
+    except Exception as exc:
+        return {"error": f"Malformed chain rows: {exc}"}
+    if not strikes:
+        return {"error": "Chain has no strikes"}
+
+    oi_ce, oi_pe, ch_ce, ch_pe = {}, {}, {}, {}
+    ltp_ce, ltp_pe, iv_ce, iv_pe = {}, {}, {}, {}
+    for r in rows:
+        s = int(_f(r["strike"]))
+        ce, pe = _leg(r, "CE"), _leg(r, "PE")
+        oi_ce[s] = _f(ce.get("oi"))
+        oi_pe[s] = _f(pe.get("oi"))
+        ch_ce[s] = _f(ce.get("oi")) - _f(ce.get("prev_oi"))
+        ch_pe[s] = _f(pe.get("oi")) - _f(pe.get("prev_oi"))
+        ltp_ce[s] = _f(ce.get("ltp"))
+        ltp_pe[s] = _f(pe.get("ltp"))
+        iv_ce[s] = _f(ce.get("iv"))
+        iv_pe[s] = _f(pe.get("iv"))
+
+    ce_oi_total = sum(oi_ce.values())
+    pe_oi_total = sum(oi_pe.values())
+    pcr = round(pe_oi_total / ce_oi_total, 2) if ce_oi_total else 0
+
+    # ATM = strike where CE/PE premiums are closest (Groww's page has no spot)
+    atm     = min(strikes, key=lambda s: abs(ltp_ce.get(s, 0) - ltp_pe.get(s, 0)))
+    atm_idx = strikes.index(atm)
+
+    # Spot via put-call parity at the money: S ≈ K + (C − P)
+    spot = atm + (ltp_ce.get(atm, 0) - ltp_pe.get(atm, 0))
+    if spot <= 0:
+        spot = float(atm)
+
+    # Max pain (canonical): strike where option buyers receive least intrinsic
+    pain = {}
+    for s in strikes:
+        pain[s] = (sum(max(0, s - k) * v for k, v in oi_ce.items())
+                   + sum(max(0, k - s) * v for k, v in oi_pe.items()))
+    max_pain = int(min(pain, key=pain.get))
+
+    ce_wall = int(max(oi_ce, key=oi_ce.get))
+    pe_wall = int(max(oi_pe, key=oi_pe.get))
+
+    fresh_ce  = int(sum(v for v in ch_ce.values() if v > 0))
+    fresh_pe  = int(sum(v for v in ch_pe.values() if v > 0))
+    unwind_ce = int(abs(sum(v for v in ch_ce.values() if v < 0)))
+    unwind_pe = int(abs(sum(v for v in ch_pe.values() if v < 0)))
+
+    skew_rng = strikes[max(0, atm_idx - 4): atm_idx + 5]
+
+    def _avg(d: dict, keys: list) -> float:
+        vals = [d[k] for k in keys if d.get(k, 0) > 0]
+        return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    def _idx(i: int, fallback: int) -> int:
+        return strikes[i] if 0 <= i < len(strikes) else fallback
+
+    otm_ce1 = _idx(atm_idx + 1, atm)
+    otm_ce2 = _idx(atm_idx + 2, otm_ce1)
+    otm_pe1 = _idx(atm_idx - 1, atm)
+    otm_pe2 = _idx(atm_idx - 2, otm_pe1)
+
+    top_ce = [{"Strike": s, "CE_OI": int(oi_ce[s]), "CE_Chng_OI": int(ch_ce[s]),
+               "CE_LTP": ltp_ce[s], "CE_IV": iv_ce[s]}
+              for s in sorted(oi_ce, key=oi_ce.get, reverse=True)[:3]]
+    top_pe = [{"Strike": s, "PE_OI": int(oi_pe[s]), "PE_Chng_OI": int(ch_pe[s]),
+               "PE_LTP": ltp_pe[s], "PE_IV": iv_pe[s]}
+              for s in sorted(oi_pe, key=oi_pe.get, reverse=True)[:3]]
+
+    return {
+        "spot": round(spot, 2), "atm": atm, "expiry": expiry or "N/A",
+        "pcr": pcr, "max_pain": max_pain,
+        "ce_wall": ce_wall, "pe_wall": pe_wall,
+        "range_width": ce_wall - pe_wall,
+        "ce_wall_ltp": ltp_ce.get(ce_wall, 0.0),
+        "pe_wall_ltp": ltp_pe.get(pe_wall, 0.0),
+        "fresh_ce": fresh_ce, "fresh_pe": fresh_pe,
+        "unwind_ce": unwind_ce, "unwind_pe": unwind_pe,
+        "avg_ce_iv": _avg(iv_ce, skew_rng), "avg_pe_iv": _avg(iv_pe, skew_rng),
+        "atm_ce_ltp": ltp_ce.get(atm, 0.0), "atm_pe_ltp": ltp_pe.get(atm, 0.0),
+        "otm_ce1": otm_ce1, "otm_ce2": otm_ce2,
+        "otm_pe1": otm_pe1, "otm_pe2": otm_pe2,
+        "otm_ce1_ltp": ltp_ce.get(otm_ce1, 0.0), "otm_ce2_ltp": ltp_ce.get(otm_ce2, 0.0),
+        "otm_pe1_ltp": ltp_pe.get(otm_pe1, 0.0), "otm_pe2_ltp": ltp_pe.get(otm_pe2, 0.0),
+        "resistance": top_ce, "support": top_pe,
+        "source": "groww",
+    }
+
+
 def _fetch_option_chain() -> dict:
+    # ── PRIMARY: Groww chain (coded in data/groww_feed.py, no auth) ────────────
+    try:
+        from data.groww_feed import get_chain, _norm_expiry
+        from data.yahoo_feed import get_nifty_spot
+
+        oc_g = get_chain()
+        if oc_g and oc_g.get("rows"):
+            metrics = option_metrics_from_groww_rows(
+                oc_g["rows"], expiry=_norm_expiry(oc_g.get("current_expiry", ""))
+            )
+            if "error" not in metrics:
+                try:
+                    live_spot = get_nifty_spot()
+                except Exception:
+                    live_spot = 0.0
+                if live_spot and live_spot > 0:
+                    metrics["spot"] = round(float(live_spot), 2)
+                if metrics.get("spot", 0) > 0:
+                    return metrics
+    except Exception as exc:
+        log.warning("Groww option chain unavailable (%s) — falling back to NSE", exc)
+
+    # ── FALLBACK: NSE chain ───────────────────────────────────────────────────
     try:
         from data.nifty_option_chain import get_nifty_option_chain, get_expiry_dates
         from data.yahoo_feed import get_nifty_spot

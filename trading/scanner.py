@@ -30,6 +30,15 @@ log = logging.getLogger(__name__)
 STRIKE_STEP = 50
 
 
+def _safe_num(v) -> float:
+    """float() that never raises and maps NaN/±Inf to 0.0."""
+    try:
+        f = float(v)
+        return 0.0 if (f != f or abs(f) == float("inf")) else f
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ── MarketBrief ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -48,6 +57,8 @@ class StrikeBrief:
     price_chng_pct: float
     oi_buildup:  str          # "BUILDING" | "UNWINDING" | "STABLE"
     trend:       str          # "UP" | "DOWN" | "FLAT"
+    delta:       float = 0.0  # option greeks (Groww chain only)
+    theta:       float = 0.0
 
 
 @dataclass
@@ -75,6 +86,8 @@ class MarketBrief:
     # Scan metadata
     scan_duration_ms: int = 0
     error:       Optional[str] = None
+    source:      str = "nse"     # "groww" | "nse" — where the option data came from
+    chain_age_s: float = -1.0    # age of the Groww chain snapshot, if used
 
     def to_ai_prompt(self, direction: str, budget: float, max_loss_pct: float) -> str:
         """
@@ -82,7 +95,7 @@ class MarketBrief:
         No fluff. Every word is signal.
         """
         lines = [
-            f"=== MARKET BRIEF {self.fetched_at} ===",
+            f"=== MARKET BRIEF {self.fetched_at}  [source={self.source}] ===",
             f"NIFTY spot={self.spot}  ATM={self.atm}  expiry={self.expiry}",
             f"PCR={self.pcr}  sentiment={self.sentiment}  MaxPain={self.max_pain}  VIX={self.vix}",
         ]
@@ -121,10 +134,11 @@ class MarketBrief:
         lines.append("TARGETED STRIKE CHARTS:")
         for t in self.targeted:
             oi_tag = {"BUILDING": "↑OI", "UNWINDING": "↓OI", "STABLE": "=OI"}.get(t.oi_buildup, "")
+            greek = f"  Δ={t.delta:+.2f} Θ={t.theta:+.2f}" if (t.delta or t.theta) else ""
             lines.append(
                 f"  {t.strike}{t.option_type}  LTP=₹{t.ltp}  prev_close=₹{t.prev_close}"
                 f"  H={t.high} L={t.low}  chng={t.price_chng_pct:+.1f}%"
-                f"  IV={t.iv}  OI={t.oi:,}  {oi_tag}  trend={t.trend}"
+                f"  IV={t.iv}{greek}  OI={t.oi:,}  {oi_tag}  trend={t.trend}"
             )
 
         lines += [
@@ -216,8 +230,21 @@ class MarketScanner:
         from data.yahoo_feed import get_nifty_spot, get_india_vix
 
         # ══════════════════════════════════════════════════════════════════════
+        # STEP 1 — Groww option chain (PRIMARY source)
+        # data/groww_feed.py serves live LTP / OI / IV / delta / theta per strike
+        # with no auth. Used whenever Groww is serving the expiry we asked for;
+        # the NSE path below stays as the fallback.
+        # ══════════════════════════════════════════════════════════════════════
+        try:
+            groww_brief = self._scan_from_groww(expiry, open_strikes)
+            if groww_brief is not None:
+                return groww_brief
+        except Exception as exc:
+            log.warning("Groww scan failed (%s) — using NSE path", exc)
+
+        # ══════════════════════════════════════════════════════════════════════
         # STEP 2 — Option chain fetch   ← ALWAYS runs every cycle, no cache
-        # Source: NSE India (OI, strikes, expiry)
+        # Source: NSE India (OI, strikes, expiry) — fallback when Groww has none
         # Spot  : Yahoo Finance ^NSEI (overrides NSE underlyingValue)
         # VIX   : Yahoo Finance ^INDIAVIX
         # ══════════════════════════════════════════════════════════════════════
@@ -422,6 +449,156 @@ class MarketScanner:
             fresh_ce_writing = fresh_ce_writing,
             fresh_pe_writing = fresh_pe_writing,
             targeted         = targeted_briefs,
+        )
+
+    # ── Groww path ────────────────────────────────────────────────────────────
+
+    def _scan_from_groww(
+        self, expiry: Optional[str], open_strikes: list[tuple[int, str]]
+    ) -> Optional[MarketBrief]:
+        """
+        Build a MarketBrief straight from the Groww chain (live LTP/OI/IV/greeks).
+
+        Returns None (so the caller falls back to NSE) when:
+          • Groww has no chain right now, or
+          • the user selected an expiry different from the one Groww serves.
+        """
+        from data.groww_feed import get_chain, chain_age_seconds, _norm_expiry
+        from data.yahoo_feed import get_nifty_spot
+
+        oc = get_chain()
+        if not oc or not oc.get("rows"):
+            return None
+
+        groww_expiry = _norm_expiry(oc.get("current_expiry", ""))
+        if expiry and groww_expiry and _norm_expiry(expiry) != groww_expiry:
+            log.info(
+                "Groww chain serves %s but %s was selected — NSE path",
+                groww_expiry, expiry,
+            )
+            return None
+        expiry_str = groww_expiry or (expiry or "N/A")
+
+        rows    = sorted(oc["rows"], key=lambda r: int(r["strike"]))
+        strikes = [int(r["strike"]) for r in rows]
+
+        # Spot: live index quote preferred, else Groww's parity estimate
+        spot = 0.0
+        try:
+            spot = float(get_nifty_spot() or 0.0)
+        except Exception:
+            spot = 0.0
+        if spot <= 0:
+            spot = float(oc.get("spot") or 0.0)
+        if spot <= 0:
+            spot = float(oc.get("atm") or (strikes[len(strikes) // 2] if strikes else 0))
+            if spot <= 0:
+                return None
+
+        atm = int(oc.get("atm") or min(strikes, key=lambda x: abs(x - spot)))
+        pcr = float(oc.get("pcr") or 0.0)
+        sentiment = self._pcr_to_sentiment(pcr)
+
+        def _leg(r, side):
+            return r.get(side.lower(), {}) or {}
+
+        def _oi(r, side):
+            return _safe_num(_leg(r, side).get("oi"))
+
+        # OI walls
+        top_ce = sorted(rows, key=lambda r: _oi(r, "CE"), reverse=True)[:2]
+        top_pe = sorted(rows, key=lambda r: _oi(r, "PE"), reverse=True)[:2]
+
+        def _wall(r, side):
+            leg = _leg(r, side)
+            return {
+                "strike":  int(r["strike"]),
+                f"{side.lower()}_oi": int(_safe_num(leg.get("oi"))),
+                "chng_oi": int(_safe_num(leg.get("oi")) - _safe_num(leg.get("prev_oi"))),
+                "ltp":     round(_safe_num(leg.get("ltp")), 2),
+            }
+
+        resistance = [_wall(r, "CE") for r in top_ce]
+        support    = [_wall(r, "PE") for r in top_pe]
+
+        def _fresh(side):
+            pos = []
+            for r in rows:
+                leg = _leg(r, side)
+                add = _safe_num(leg.get("oi")) - _safe_num(leg.get("prev_oi"))
+                if add > 0:
+                    pos.append({"strike": int(r["strike"]), "added_oi": int(add)})
+            return sorted(pos, key=lambda x: x["added_oi"], reverse=True)[:2]
+
+        targets = self._select_target_strikes(spot, atm, strikes, sentiment, None)
+        wanted  = list(dict.fromkeys(list(targets) + list(open_strikes)))
+
+        targeted: list[StrikeBrief] = []
+        for strike, otype in wanted:
+            row = next((r for r in rows if int(r["strike"]) == int(strike)), None)
+            if row is None:
+                continue
+            targeted.append(self._strike_brief_groww(row, int(strike), otype))
+
+        log.info(
+            "Groww scan OK: spot=%.2f atm=%d pcr=%.2f strikes=%d targets=%s age=%ss",
+            spot, atm, pcr, len(strikes), wanted, chain_age_seconds(),
+        )
+
+        return MarketBrief(
+            fetched_at       = datetime.now().strftime("%H:%M:%S"),
+            expiry           = expiry_str,
+            spot             = round(spot, 2),
+            atm              = atm,
+            pcr              = pcr,
+            sentiment        = sentiment,
+            max_pain         = int(oc.get("max_pain") or 0),
+            vix              = self._get_vix(),
+            resistance       = resistance,
+            support          = support,
+            fresh_ce_writing = _fresh("CE"),
+            fresh_pe_writing = _fresh("PE"),
+            targeted         = targeted,
+            source           = "groww",
+            chain_age_s      = chain_age_seconds(),
+        )
+
+    def _strike_brief_groww(self, row: dict, strike: int, otype: str) -> StrikeBrief:
+        """StrikeBrief from one Groww chain row (no chart API call needed)."""
+        leg      = row.get(otype.lower(), {}) or {}
+        ltp      = _safe_num(leg.get("ltp"))
+        close    = _safe_num(leg.get("close"))
+        oi       = _safe_num(leg.get("oi"))
+        prev_oi  = _safe_num(leg.get("prev_oi"))
+        change   = _safe_num(leg.get("change"))
+        chng_oi  = oi - prev_oi
+        pct      = round(change / close * 100, 2) if close else 0.0
+
+        base = max(abs(prev_oi), 1)
+        if   chng_oi >  base * 0.05: oi_buildup = "BUILDING"
+        elif chng_oi < -base * 0.05: oi_buildup = "UNWINDING"
+        else:                        oi_buildup = "STABLE"
+
+        trend = "UP" if change > 0 else ("DOWN" if change < 0 else "FLAT")
+        hi = max(ltp, close) if (ltp and close) else ltp
+        lo = min(ltp, close) if (ltp and close) else ltp
+
+        return StrikeBrief(
+            strike         = strike,
+            option_type    = otype,
+            ltp            = round(ltp, 2),
+            prev_close     = round(close, 2),
+            high           = round(hi, 2),
+            low            = round(lo, 2),
+            oi             = int(oi),
+            chng_oi        = int(chng_oi),
+            iv             = round(_safe_num(leg.get("iv")), 2),
+            volume         = 0,
+            price_chng_pct = pct,
+            oi_buildup     = oi_buildup,
+            trend          = trend,
+            delta          = round(_safe_num(leg.get("delta")), 3),
+            theta          = round(_safe_num(leg.get("theta")), 2),
         )
 
     def _select_target_strikes(

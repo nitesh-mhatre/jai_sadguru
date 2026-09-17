@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -40,6 +41,18 @@ log = logging.getLogger(__name__)
 GROWW_OPTIONS_PAGE = "https://groww.in/options/nifty"
 GROWW_CHAIN_API    = ("https://groww.in/v1/api/stocks_data/derivatives/v1/"
                       "option-chain?underlying=NIFTY&expiry={expiry}")
+
+# Groww delayed charting service. Verified live for NSE equities
+# (segment/CASH returns real OHLCV). F&O instruments are addressed by the
+# contract id carried in the option chain (growwContractId).
+GROWW_CHART_API = ("https://groww.in/v1/api/charting_service/v2/chart/delayed/"
+                   "exchange/NSE/segment/{segment}/{instrument}")
+
+# interval label → minutes (None = unsupported on this route)
+_INTERVAL_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15,
+    "30m": 30, "60m": 60, "1h": 60, "1d": None,
+}
 
 _HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -102,7 +115,6 @@ def _option_chain_from_next(data: dict) -> Optional[dict]:
         "rows": [],
     }
 
-    spot = 0.0
     for c in oc.get("optionContracts", []) or []:
         try:
             strike = round(float(c.get("strikePrice", 0)) / 100.0)
@@ -162,12 +174,107 @@ def _option_chain_from_next(data: dict) -> Optional[dict]:
         # ATM estimate: smallest |CE ltp − PE ltp|
         atm_rows = [r for r in rows if "_abs_diff" in r]
         if atm_rows:
-            atm = min(atm_rows, key=lambda r: r["_abs_diff"])["strike"]
+            atm_row = min(atm_rows, key=lambda r: r["_abs_diff"])
+            atm     = atm_row["strike"]
             out["atm"] = atm
-            out["spot"] = float(atm)
+            ce_ltp = float(atm_row["ce"].get("ltp", 0.0) or 0.0)
+            pe_ltp = float(atm_row["pe"].get("ltp", 0.0) or 0.0)
+            # Put-call parity at the money: C − P ≈ S − K  →  S ≈ K + (C − P).
+            # Groww's page omits spot, so this estimate is the closest proxy;
+            # callers prefer a live index quote when one is available.
+            if ce_ltp > 0 and pe_ltp > 0:
+                out["spot_est"] = round(atm + (ce_ltp - pe_ltp), 2)
+                out["atm_straddle"] = round(ce_ltp + pe_ltp, 2)
+            else:
+                out["spot_est"] = float(atm)
 
-    out["spot"] = spot
+    out["spot"] = out.get("spot_est") or 0.0
     return out
+
+
+# ── Chain cache ───────────────────────────────────────────────────────────────
+# The live trader asks for spot/OI/LTP every few seconds. Scraping the page on
+# every request would hammer Groww and slow the loop, so the normalized chain is
+# cached briefly — a chain a few seconds old is still accurate enough to price
+# an open position.
+
+_CHAIN_TTL   = 8.0                                  # seconds
+_CHAIN_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def get_chain(force: bool = False) -> Optional[dict]:
+    """
+    Normalized option-chain block for the expiry Groww is currently serving.
+    Cached for _CHAIN_TTL seconds; pass force=True to bypass the cache.
+    Returns None when the page cannot be fetched or parsed.
+    """
+    now = time.time()
+    cached = _CHAIN_CACHE.get("data")
+    if cached is not None and not force and (now - _CHAIN_CACHE["ts"]) < _CHAIN_TTL:
+        return cached
+
+    data = _fetch_next_data()
+    oc   = _option_chain_from_next(data) if data else None
+    if oc:
+        _CHAIN_CACHE["data"] = oc
+        _CHAIN_CACHE["ts"]   = now
+    return oc
+
+
+def chain_age_seconds() -> float:
+    """Age of the cached chain in seconds (−1.0 when nothing is cached yet)."""
+    if not _CHAIN_CACHE.get("data"):
+        return -1.0
+    return round(time.time() - _CHAIN_CACHE["ts"], 1)
+
+
+def get_quote(expiry: str, strike: int, side: str) -> dict:
+    """
+    Live quote for one option contract straight from the Groww chain.
+
+    Returns a dict with ltp / close / change / oi / oi_change / iv / delta /
+    theta / pop plus `chain_age_s`, or {} when the strike/side is not in the
+    chain. Never raises.
+    """
+    side = (side or "").upper()
+    if side not in ("CE", "PE"):
+        return {}
+    try:
+        oc = get_chain()
+    except Exception as exc:
+        log.warning("Groww quote fetch failed: %s", exc)
+        return {}
+    if not oc:
+        return {}
+    try:
+        target = int(round(float(strike)))
+    except (TypeError, ValueError):
+        return {}
+
+    for r in oc.get("rows", []):
+        if int(r.get("strike", 0)) != target:
+            continue
+        leg  = r.get(side.lower(), {}) or {}
+        oi   = _num(leg.get("oi"))
+        prev = _num(leg.get("prev_oi"))
+        return {
+            "strike":      target,
+            "side":        side,
+            "ltp":         _num(leg.get("ltp")),
+            "close":       _num(leg.get("close")),
+            "change":      _num(leg.get("change")),
+            "oi":          int(oi),
+            "prev_oi":     int(prev),
+            "oi_change":   int(oi - prev),
+            "iv":          _num(leg.get("iv")),
+            "delta":       _num(leg.get("delta")),
+            "theta":       _num(leg.get("theta")),
+            "pop":         _num(leg.get("pop")),
+            "expiry":      _norm_expiry(oc.get("current_expiry", "")) or expiry,
+            "source":      "groww",
+            "chain_age_s": chain_age_seconds(),
+        }
+    return {}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -199,14 +306,12 @@ def get_expiries() -> list[str]:
     NIFTY expiry dates, nearest first, normalized to DD-Mon-YYYY
     (Groww returns YYYY-MM-DD; NSE returns DD-Mon-YYYY).
     """
-    data = _fetch_next_data()
-    if data:
-        oc = _option_chain_from_next(data)
-        if oc and oc.get("expiry_dates"):
-            dates = [_norm_expiry(e) for e in oc["expiry_dates"]]
-            dates = [d for d in dates if d]
-            if dates:
-                return (_norm_expiry(oc.get("current_expiry", "")) or dates[0], dates)
+    oc = get_chain()
+    if oc and oc.get("expiry_dates"):
+        dates = [_norm_expiry(e) for e in oc["expiry_dates"]]
+        dates = [d for d in dates if d]
+        if dates:
+            return (_norm_expiry(oc.get("current_expiry", "")) or dates[0], dates)
 
     # ── Fallback: NSE ─────────────────────────────────────────────────────
     try:
@@ -226,8 +331,7 @@ def get_option_chain_snapshot(expiry: str = "") -> dict:
     """
     out: dict = {"source": "groww", "expiry": expiry}
 
-    data = _fetch_next_data()
-    oc = _option_chain_from_next(data) if data else None
+    oc = get_chain()
 
     if oc:
         out.update({
@@ -238,7 +342,9 @@ def get_option_chain_snapshot(expiry: str = "") -> dict:
             "ce_wall":    oc.get("ce_wall", 0),
             "pe_wall":    oc.get("pe_wall", 0),
             "expiries":   oc.get("expiry_dates", []),
-            "groww_expiry": oc.get("current_expiry", ""),
+            "groww_expiry": _norm_expiry(oc.get("current_expiry", "")),
+            "atm_straddle": oc.get("atm_straddle", 0),
+            "chain_age_s":  chain_age_seconds(),
         })
     else:
         out["source"] = "nse-fallback"
@@ -285,15 +391,41 @@ def get_option_chain_snapshot(expiry: str = "") -> dict:
     return out
 
 
+def get_levels_snapshot(expiry: str, levels: list | None = None) -> dict:
+    """
+    Current market strip for the UI: the live NIFTY spot block plus a live quote
+    for every tracked level.
+
+    Returns
+    -------
+    {
+      "snapshot": {spot, atm, pcr, max_pain, ce_wall, pe_wall, atm_straddle, ...},
+      "levels":   [{strike, side, ltp, oi, oi_change, iv, delta, theta, ...}, ...],
+    }
+    A level with no chain quote is returned with ltp=0 so the caller can show it
+    as '—' instead of dropping the row silently.
+    """
+    snap   = get_option_chain_snapshot(expiry)
+    quotes: list[dict] = []
+    for lv in levels or []:
+        try:
+            strike = int(lv.get("strike"))
+            side   = str(lv.get("side", "")).upper()
+        except (TypeError, ValueError):
+            continue
+        q = get_quote(expiry, strike, side)
+        quotes.append(q or {"strike": strike, "side": side, "ltp": 0.0,
+                            "oi": 0, "oi_change": 0, "iv": 0.0,
+                            "delta": 0.0, "theta": 0.0, "source": "none"})
+    return {"snapshot": snap, "levels": quotes}
+
+
 def get_chain_table(expiry: str = "") -> list[dict]:
     """
     Full chain rows for the selected expiry:
       [{strike, ce:{ltp,oi,iv,oi_change,...}, pe:{...}}, ...] sorted by strike.
     """
-    data = _fetch_next_data()
-    if not data:
-        return []
-    oc = _option_chain_from_next(data)
+    oc = get_chain()
     if not oc:
         return []
     rows = oc.get("rows", [])
@@ -305,18 +437,132 @@ def get_chain_table(expiry: str = "") -> list[dict]:
 
 # ── Option premium candles ────────────────────────────────────────────────────
 
-def fetch_option_candles(expiry: str, strike: int, side: str,
-                         interval: str = "5m", limit: int = 600) -> pd.DataFrame:
+def get_contract_id(expiry: str, strike: int, side: str) -> str:
     """
-    Historical premium candles for one option contract from Groww.
+    Groww contract id for one option leg, taken from the cached chain row.
+    Empty string when the chain (or that strike/expiry) is unavailable.
+    """
+    side = (side or "").upper()
+    oc = get_chain()
+    if not oc:
+        return ""
+    try:
+        target = int(round(float(strike)))
+    except (TypeError, ValueError):
+        return ""
+    for r in oc.get("rows", []):
+        if int(r.get("strike", 0)) != target:
+            continue
+        leg = r.get(side.lower(), {}) or {}
+        return str(leg.get("contract_id") or leg.get("token") or "")
+    return ""
 
-    NOTE: Groww builds its option charts client-side and no stable public
-    JSON candle endpoint was verifiable (Trading API api.groww.in supports
-    candles but requires auth tokens). This returns an empty DataFrame and
-    callers fall back to their premium model. Kept for future wiring.
+
+def _candles_from_groww_chart(instrument: str, interval: str, limit: int,
+                              days: int) -> pd.DataFrame:
+    """Premium/history candles from the Groww delayed charting service."""
+    mins = _INTERVAL_MINUTES.get(interval, 5)
+    if mins is None:
+        return pd.DataFrame()
+
+    end_ms   = int(time.time() * 1000)
+    start_ms = end_ms - max(days, 1) * 24 * 60 * 60 * 1000
+    params   = {
+        "intervalInMinutes": mins,
+        "startTimeInMillis": start_ms,
+        "endTimeInMillis":   end_ms,
+    }
+
+    for segment in ("FNO", "CASH"):
+        url = GROWW_CHART_API.format(segment=segment, instrument=instrument)
+        try:
+            r = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT, params=params)
+            if r.status_code != 200:
+                log.debug("Groww chart %s → HTTP %d", segment, r.status_code)
+                continue
+            rows = (r.json() or {}).get("candles") or []
+            if not rows:
+                continue
+            # Groww rows: [epoch_seconds, open, high, low, close, volume]
+            df = pd.DataFrame(rows)
+            if df.shape[1] < 5:
+                continue
+            df = df.iloc[:, :6]
+            df.columns = ["ts", "open", "high", "low", "close", "volume"][:df.shape[1]]
+            df["timestamp"] = (pd.to_datetime(df["ts"], unit="s", utc=True)
+                                 .dt.tz_convert("Asia/Kolkata")
+                                 .dt.tz_localize(None))
+            df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+            return df.tail(limit).reset_index(drop=True)
+        except Exception as exc:
+            log.debug("Groww chart fetch failed (%s): %s", instrument, exc)
+    return pd.DataFrame()
+
+
+def _candles_from_nse(expiry: str, strike: int, side: str,
+                      interval: str = "5m") -> pd.DataFrame:
     """
-    log.info("Groww premium candles unavailable without auth — "
-             "caller fallback applies (%s %s%s)", strike, side, expiry)
+    Real NSE intraday premium candles (current session only) via the cookie
+    session, resampled to the requested candle size.
+    """
+    try:
+        from data.nifty_chart import build_identifier, fetch_chart_data
+    except Exception:
+        return pd.DataFrame()
+    try:
+        ident = build_identifier(_norm_expiry(expiry), float(strike), side)
+        raw   = fetch_chart_data(ident)
+    except Exception as exc:
+        log.debug("NSE option chart failed for %s%s: %s", strike, side, exc)
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    try:
+        df = raw.rename(columns={"price": "close"}).copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        mins = _INTERVAL_MINUTES.get(interval, 5) or 5
+        ohlc = df["close"].resample(f"{mins}min").ohlc()
+        ohlc["volume"] = df.get("volume", pd.Series(0, index=df.index)) \
+                           .resample(f"{mins}min").sum()
+        return ohlc.dropna(subset=["close"]).reset_index()
+    except Exception as exc:
+        log.debug("NSE candle resample failed: %s", exc)
+        return pd.DataFrame()
+
+
+def fetch_option_candles(expiry: str, strike: int, side: str,
+                        interval: str = "5m", limit: int = 600,
+                        days: int = 5) -> pd.DataFrame:
+    """
+    Historical premium candles for one option contract.
+
+    Sources, first that yields data wins:
+      1. Groww charting service using the chain's own contract id (real Groww data)
+      2. NSE intraday chart via the cookie session (real, current session)
+
+    Returns a DataFrame with timestamp / open / high / low / close / volume / source,
+    sorted oldest-first, or an empty DataFrame when neither source has data
+    (the caller then builds an index-aligned model series).
+    """
+    instrument = get_contract_id(expiry, strike, side)
+    if instrument:
+        df = _candles_from_groww_chart(instrument, interval, limit, days)
+        if not df.empty:
+            df["source"] = "groww"
+            log.info("Groww option candles %s%s: %d rows", strike, side, len(df))
+            return df
+
+    df = _candles_from_nse(expiry, strike, side, interval)
+    if not df.empty:
+        df["source"] = "nse"
+        log.info("NSE option candles %s%s: %d rows", strike, side, len(df))
+        return df.tail(limit).reset_index(drop=True)
+
+    log.info("No live premium history for %s%s%s — caller will model it",
+             strike, side, expiry)
     return pd.DataFrame()
 
 

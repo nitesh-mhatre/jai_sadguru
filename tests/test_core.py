@@ -9,6 +9,7 @@ Run:  python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,13 @@ class TestGoParser(unittest.TestCase):
         self.assertEqual(p["direction"], "BOTH")
         self.assertEqual(p["max_loss_pct"], 10.0)
         self.assertEqual(p["budget"], 100000.0)
+
+    def test_budget_explicit_flag(self):
+        self.assertTrue(parse_go_command("budget 50000")["budget_explicit"])
+        self.assertTrue(parse_go_command("only sell budget 25000")["budget_explicit"])
+        # "/sim 3d" states no budget — callers may substitute a sensible default
+        self.assertFalse(parse_go_command("3d")["budget_explicit"])
+        self.assertFalse(parse_go_command("")["budget_explicit"])
 
 
 # ── Agent JSON extractor ──────────────────────────────────────────────────────
@@ -311,6 +319,364 @@ class TestGrowwParser(unittest.TestCase):
     def test_expiry_dates_preserved(self):
         oc = _option_chain_from_next(self._fixture())
         self.assertEqual(oc["expiry_dates"], ["2026-09-22", "2026-09-29"])
+
+    def test_spot_estimate_uses_put_call_parity(self):
+        # ATM is 23250 (CE 105 − PE 95 = 10) → spot ≈ 23250 + 10
+        oc = _option_chain_from_next(self._fixture())
+        self.assertEqual(oc["atm"], 23250)
+        self.assertEqual(oc["spot"], 23260.0)
+        self.assertEqual(oc["atm_straddle"], 200.0)
+
+
+# ── Groww chain → predictor metrics (pure, offline) ───────────────────────────
+
+from trading.next_predictor import option_metrics_from_groww_rows  # noqa: E402
+
+
+def _groww_rows():
+    def leg(ltp, oi, prev_oi, iv):
+        return {"ltp": ltp, "oi": oi, "prev_oi": prev_oi, "iv": iv}
+    return [
+        {"strike": 23000, "ce": leg(320, 900, 700, 12),   "pe": leg(2.0, 100, 90, 13)},
+        {"strike": 23250, "ce": leg(105, 500, 400, 11),   "pe": leg(95, 600, 550, 12)},
+        {"strike": 23500, "ce": leg(25, 1200, 1000, 12.5), "pe": leg(360, 1100, 900, 13)},
+    ]
+
+
+class TestGrowwMetrics(unittest.TestCase):
+
+    def test_core_metrics(self):
+        m = option_metrics_from_groww_rows(_groww_rows(), expiry="22-Sep-2026")
+        self.assertEqual(m["source"], "groww")
+        self.assertEqual(m["atm"], 23250)
+        self.assertEqual(m["pcr"], round(1800 / 2600, 2))
+        self.assertEqual(m["max_pain"], 23250)
+        self.assertEqual(m["ce_wall"], 23500)
+        self.assertEqual(m["pe_wall"], 23500)
+        self.assertEqual(m["fresh_ce"], 500)
+        self.assertEqual(m["fresh_pe"], 260)
+        self.assertEqual(m["unwind_ce"], 0)
+        self.assertEqual(m["expiry"], "22-Sep-2026")
+
+    def test_spot_parity_and_atm_strikes(self):
+        m = option_metrics_from_groww_rows(_groww_rows())
+        self.assertEqual(m["spot"], 23260.0)
+        self.assertEqual(m["atm_ce_ltp"], 105)
+        self.assertEqual(m["atm_pe_ltp"], 95)
+        # OTM strikes step outward from ATM
+        self.assertEqual(m["otm_ce1"], 23500)
+        self.assertEqual(m["otm_pe1"], 23000)
+
+    def test_empty_rows_returns_error(self):
+        self.assertIn("error", option_metrics_from_groww_rows([]))
+
+
+# ── Loss → rule.md section mapping ────────────────────────────────────────────
+
+from trading.live_mode import loss_section  # noqa: E402
+
+
+class TestLossSection(unittest.TestCase):
+
+    def test_mapping(self):
+        self.assertEqual(loss_section("SIDEWAYS"), "REGIME SIDEWAYS")
+        self.assertEqual(loss_section("DIRECTIONAL_BULL"), "REGIME DIRECTIONAL")
+        self.assertEqual(loss_section("STRONGLY_BEARISH"), "REGIME DIRECTIONAL")
+        self.assertEqual(loss_section("VOLATILE"), "REGIME VOLATILE")
+        self.assertEqual(loss_section("UNKNOWN"), "GLOBAL")
+        self.assertEqual(loss_section(""), "GLOBAL")
+
+
+class TestTradeCloseReason(unittest.TestCase):
+
+    def test_sl_hit_sets_reason(self):
+        t = _make_trade()
+        t.update_price(70.0)
+        self.assertEqual(t.status, "SL_HIT")
+        self.assertEqual(t.close_reason, "stop-loss hit")
+
+    def test_manual_close_sets_reason(self):
+        s = TradingSession(budget=100_000, max_loss_pct=10, direction="BOTH")
+        s.add_trade(_make_trade())
+        s.close_trade("T001", 110.0)
+        self.assertEqual(s.closed_trades[0].close_reason, "manual close")
+
+
+# ── Breakeven + trailing stop-loss management ─────────────────────────────────
+
+class TestStopLossManagement(unittest.TestCase):
+
+    def test_starts_at_initial_stage(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=150.0)
+        self.assertEqual(t.sl_stage, "INITIAL")
+        self.assertEqual(t.initial_sl, 75.0)
+        self.assertFalse(t.sl_moved)
+
+    def test_no_move_before_trigger(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=150.0)
+        t.update_price(110.0)                    # only 20% of the move
+        self.assertEqual(t.sl, 75.0)
+        self.assertEqual(t.sl_stage, "INITIAL")
+
+    def test_breakeven_after_half_move(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=150.0, trail_pct=0.5)
+        t.update_price(124.0)                    # 48% — not yet
+        self.assertEqual(t.sl_stage, "INITIAL")
+        self.assertFalse(t.update_price(126.0))  # 52% — breakeven, but trail below entry
+        self.assertEqual(t.sl_stage, "BREAKEVEN")
+        self.assertEqual(t.sl, 100.0)
+        self.assertTrue(t.sl_moved)
+
+    def test_breakeven_stop_exits_near_flat(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=150.0, trail_pct=0.5)
+        t.update_price(126.0)                    # SL now at entry
+        self.assertTrue(t.update_price(99.0))    # dips to entry
+        self.assertEqual(t.status, "SL_HIT")
+        self.assertIn("breakeven", t.close_reason)
+        self.assertGreater(t.pnl, -100)          # tiny, vs the original 25-pt risk
+
+    def test_trailing_only_moves_up(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=200.0)
+        t.update_price(170.0)                    # BE + trail 170 × 0.75 = 127.5
+        self.assertEqual(t.sl_stage, "TRAILING")
+        self.assertAlmostEqual(t.sl, 127.5, places=2)
+        t.update_price(160.0)                    # pullback must NOT lower the SL
+        self.assertAlmostEqual(t.sl, 127.5, places=2)
+
+    def test_trailing_stop_locks_profit(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=200.0)
+        t.update_price(170.0)
+        self.assertTrue(t.update_price(120.0))   # below the trailing SL
+        self.assertEqual(t.status, "SL_HIT")
+        self.assertIn("trailing", t.close_reason)
+        self.assertGreater(t.pnl, 0)             # exited in profit, not a round-trip
+
+    def test_sell_side_trailing(self):
+        t = _make_trade(action="SELL", entry_price=100.0, sl=130.0, target=50.0)
+        t.update_price(75.0)                     # BE then trail 75 × 1.25 = 93.75
+        self.assertEqual(t.sl_stage, "TRAILING")
+        self.assertAlmostEqual(t.sl, 93.75, places=2)
+        self.assertTrue(t.update_price(95.0))    # premium back above the trail
+        self.assertEqual(t.status, "SL_HIT")
+        self.assertGreater(t.pnl, 0)
+
+    def test_progress_zero_when_target_wrong_side(self):
+        t = _make_trade(entry_price=100.0, sl=75.0, target=90.0)
+        t.mfe_price = 120.0
+        self.assertEqual(t.profit_progress, 0.0)
+        t._manage_stop_loss()
+        self.assertEqual(t.sl, 75.0)
+
+
+# ── Partial profit booking (T1) ───────────────────────────────────────────────
+
+class TestPartialBooking(unittest.TestCase):
+
+    def test_single_lot_cannot_be_split(self):
+        t = _make_trade(qty=1, entry_price=100.0, sl=75.0, target=200.0)
+        self.assertEqual(t.planned_partial_lots, 0)
+        t.update_price(160.0)                    # 60% of the move
+        self.assertEqual(t.partial_booked_lots, 0)
+        self.assertEqual(t.remaining_lots, 1)
+
+    def test_books_half_at_t1(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0)
+        self.assertEqual(t.planned_partial_lots, 1)
+        self.assertAlmostEqual(t.partial_target_price, 150.0, places=2)
+        t.update_price(149.0)                    # just below T1
+        self.assertEqual(t.partial_booked_lots, 0)
+        t.update_price(150.0)                    # T1 hit
+        self.assertEqual(t.partial_booked_lots, 1)
+        self.assertEqual(t.remaining_lots, 1)
+        self.assertAlmostEqual(t.partial_pnl, 3750.0, places=2)   # 1 lot × 75 × 50
+
+    def test_pnl_adds_partial_and_runner(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0)
+        t.update_price(150.0)                    # book 1 lot
+        t.update_price(160.0)                    # runner marked up
+        self.assertAlmostEqual(t.pnl, 3750.0 + 4500.0, places=2)
+
+    def test_no_partial_on_a_loser(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0)
+        t.update_price(80.0)
+        self.assertEqual(t.partial_booked_lots, 0)
+        self.assertEqual(t.partial_pnl, 0.0)
+
+    def test_remaining_cost_basis_frees_budget(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0)
+        self.assertEqual(t.cost_basis, 100.0 * 150)
+        t.update_price(150.0)
+        self.assertEqual(t.remaining_cost_basis, 100.0 * 75)
+
+    def test_explicit_partial_target(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0,
+                        partial_target=130.0)
+        self.assertEqual(t.partial_target_price, 130.0)
+        t.update_price(130.0)
+        self.assertEqual(t.partial_booked_lots, 1)
+
+    def test_sell_side_partial(self):
+        t = _make_trade(qty=2, action="SELL", entry_price=100.0,
+                        sl=150.0, target=0.0)
+        self.assertAlmostEqual(t.partial_target_price, 50.0, places=2)
+        t.update_price(50.0)
+        self.assertEqual(t.partial_booked_lots, 1)
+        self.assertAlmostEqual(t.partial_pnl, 3750.0, places=2)
+
+    def test_partial_disabled_by_pct_zero(self):
+        t = _make_trade(qty=2, entry_price=100.0, sl=75.0, target=200.0,
+                        partial_pct=0.0)
+        t.update_price(160.0)
+        self.assertEqual(t.partial_booked_lots, 0)
+
+
+# ── Time-based exits ──────────────────────────────────────────────────────────
+
+from trading.engine import _hhmm_to_minutes  # noqa: E402
+
+
+class TestTimeExits(unittest.TestCase):
+
+    def test_hhmm_parsing(self):
+        self.assertEqual(_hhmm_to_minutes("15:15"), 915)
+        self.assertEqual(_hhmm_to_minutes("09:05"), 545)
+        self.assertEqual(_hhmm_to_minutes("bad"), -1)
+        self.assertEqual(_hhmm_to_minutes("25:99"), -1)
+        self.assertEqual(_hhmm_to_minutes(""), -1)
+
+    def test_hard_exit_time(self):
+        t   = _make_trade()
+        now = time.time()
+        self.assertEqual(t.should_time_exit(now, "15:14", "15:15"), "")
+        self.assertIn("hard time exit", t.should_time_exit(now, "15:15", "15:15"))
+        self.assertIn("hard time exit", t.should_time_exit(now, "15:20", "15:15"))
+
+    def test_max_hold(self):
+        t   = _make_trade(max_hold_minutes=60)
+        now = time.time()
+        t.opened_at_ts = now - 59 * 60
+        self.assertEqual(t.should_time_exit(now, "11:00", "15:15"), "")
+        t.opened_at_ts = now - 61 * 60
+        self.assertIn("max hold 60m", t.should_time_exit(now, "11:00", "15:15"))
+
+    def test_disabled_when_no_rules(self):
+        t = _make_trade(max_hold_minutes=None)
+        t.opened_at_ts = time.time() - 10_000
+        self.assertEqual(t.should_time_exit(time.time(), "11:00", ""), "")
+
+    def test_closed_order_never_times_out(self):
+        t = _make_trade()
+        t._close("CLOSED", 110.0, "manual close")
+        self.assertEqual(t.should_time_exit(time.time(), "15:30", "15:15"), "")
+
+    def test_held_minutes(self):
+        t = _make_trade()
+        t.opened_at_ts = 1_000_000.0
+        self.assertAlmostEqual(t.held_minutes(1_000_000.0 + 90 * 60), 90.0, places=3)
+
+
+# ── Level premium series (index-aligned, Groww-anchored) ──────────────────────
+
+import pandas as pd  # noqa: E402
+
+from trading.sim_mode import (  # noqa: E402
+    SIM_WINDOW_BARS, _anchored_premium_series, _model_premium_series,
+    _premium_source, plan_replay,
+)
+
+
+class TestReplayPlan(unittest.TestCase):
+    """The replay must slide across the WHOLE download, 1 candle per decision."""
+
+    def test_full_series_is_replayed(self):
+        # 500 candles, 200-bar window: bars 0-200, then 1-201 … 299 more steps
+        win, cycles = plan_replay(500)
+        self.assertEqual(win, SIM_WINDOW_BARS)
+        self.assertEqual(cycles, 500 - win - 1)
+
+    def test_decisions_cover_the_tail_of_the_data(self):
+        # The loop stops at n-2 so the very last candle is left to validate the
+        # final prediction, so the last decision's window ends on bar n-2.
+        win, cycles = plan_replay(500)
+        self.assertEqual(win + cycles - 1, 498)
+        self.assertEqual(plan_replay(1000)[0] + plan_replay(1000)[1] - 1, 998)
+
+    def test_longer_download_means_more_decisions(self):
+        self.assertGreater(plan_replay(1000)[1], plan_replay(500)[1])
+
+    def test_short_download_shrinks_window_but_still_runs(self):
+        win, cycles = plan_replay(150)
+        self.assertLess(win, SIM_WINDOW_BARS)
+        self.assertGreaterEqual(cycles, 1)
+        self.assertEqual(cycles, 150 - win - 1)
+
+    def test_explicit_window_and_cycle_cap(self):
+        self.assertEqual(plan_replay(500, window=100), (100, 399))
+        self.assertEqual(plan_replay(500, max_cycles=10)[1], 10)
+
+    def test_never_exceeds_available_data(self):
+        for n in (5, 10, 40, 150):
+            win, cycles = plan_replay(n, max_cycles=10_000)
+            self.assertLessEqual(win + cycles - 1, n - 1)
+            self.assertGreaterEqual(win, 2)
+
+
+def _index_grid(prices):
+    idx = pd.date_range("2026-09-15 09:15", periods=len(prices), freq="5min")
+    return pd.DataFrame({"open": prices, "high": prices, "low": prices,
+                         "close": prices, "volume": 0}, index=idx)
+
+
+class TestLevelPremiumSeries(unittest.TestCase):
+
+    def test_anchored_to_real_chain_quote(self):
+        hist = _index_grid([23250.0] * 10)
+        leg  = {"ltp": 115.8, "delta": -0.39, "theta": -12.4, "iv": 13.02}
+        df   = _model_premium_series(23150, "PE", hist, chain_leg=leg)
+        self.assertEqual(len(df), len(hist))                  # same time frame
+        self.assertEqual(_premium_source(df), "groww-anchored")
+        self.assertAlmostEqual(df["close"].iloc[0], 115.8, places=2)
+
+    def test_pe_rises_when_index_falls(self):
+        hist = _index_grid([23300.0, 23250.0, 23200.0])
+        leg  = {"ltp": 100.0, "delta": -0.40, "theta": 0.0}
+        df   = _model_premium_series(23150, "PE", hist, chain_leg=leg)
+        self.assertGreater(df["close"].iloc[-1], df["close"].iloc[0])
+
+    def test_ce_falls_when_index_falls(self):
+        hist = _index_grid([23300.0, 23250.0, 23200.0])
+        leg  = {"ltp": 100.0, "delta": 0.40, "theta": 0.0}
+        df   = _model_premium_series(23300, "CE", hist, chain_leg=leg)
+        self.assertLess(df["close"].iloc[-1], df["close"].iloc[0])
+
+    def test_never_below_intrinsic(self):
+        hist = _index_grid([23260.0, 23100.0, 22800.0])
+        leg  = {"ltp": 5.0, "delta": -0.05, "theta": 0.0}
+        df   = _model_premium_series(23150, "PE", hist, chain_leg=leg)
+        for spot, p in zip(hist["close"], df["close"]):
+            self.assertGreaterEqual(p, max(0.0, 23150.0 - spot) - 1e-9)
+
+    def test_theta_decays_series(self):
+        hist = _index_grid([23250.0] * 20)
+        leg  = {"ltp": 120.0, "delta": 0.0, "theta": -12.0}
+        df   = _model_premium_series(23150, "PE", hist, chain_leg=leg)
+        self.assertLess(df["close"].iloc[-1], df["close"].iloc[0])
+
+    def test_falls_back_to_model_without_quote(self):
+        hist = _index_grid([23250.0] * 5)
+        self.assertEqual(_premium_source(_model_premium_series(23150, "PE", hist)),
+                         "model")
+        self.assertEqual(
+            _premium_source(_model_premium_series(23150, "PE", hist,
+                                                 chain_leg={"ltp": 0.0})),
+            "model")
+
+    def test_anchored_helper_is_pure(self):
+        hist = _index_grid([23250.0] * 4)
+        df   = _anchored_premium_series(23150, "PE", hist,
+                                        {"ltp": 100.0, "delta": -0.5, "theta": 0.0})
+        self.assertEqual(list(df.columns)[:6],
+                         ["timestamp", "open", "high", "low", "close", "volume"])
 
 
 if __name__ == "__main__":
