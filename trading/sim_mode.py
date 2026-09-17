@@ -674,7 +674,13 @@ class SimTrader:
         Returns (direction, reason, from_llm).
         from_llm=False means the direction did NOT come from the model — it was
         derived from price momentum because the LLM was unavailable/unparseable.
+
+        Uses FAST_MODEL_TIMEOUT (2 min) hard cutoff. On timeout or 500/502/503
+        the connection is cut immediately and the rule-based fallback is used.
         """
+        import time as _time_mod
+        from config import FAST_MODEL_TIMEOUT
+
         if self._llm_fail_streak >= 3:
             return (self._fallback_direction(momentum),
                     "LLM bypassed (failing) — momentum-based", False)
@@ -697,6 +703,7 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
 
         from agent import Session, FinalAnswerEvent, ErrorEvent, extract_json
         temp = Session()
+        _start = _time_mod.monotonic()
         try:
             for ev in self.agent.run(prompt, temp,
                                      system_suffix="Reply only with the JSON vote."):
@@ -715,6 +722,13 @@ Vote on the NEXT cycle direction. Reply ONLY with JSON:
                         self._log("LLM failing repeatedly — switching to momentum-only votes", "WARN")
                     return (self._fallback_direction(momentum),
                             f"LLM FAILED ({ev.message[:40]}) — momentum fallback", False)
+                # Hard timeout cut — do NOT wait for the LLM beyond 2 min
+                if _time_mod.monotonic() - _start > FAST_MODEL_TIMEOUT:
+                    self._llm_fail_streak += 1
+                    self._log("LLM vote timed out (%ss) — momentum fallback", "WARN",
+                              FAST_MODEL_TIMEOUT)
+                    return (self._fallback_direction(momentum),
+                            "LLM timeout — momentum fallback", False)
         except Exception as exc:
             self._llm_fail_streak += 1
             log.warning("LLM vote failed: %s", exc)

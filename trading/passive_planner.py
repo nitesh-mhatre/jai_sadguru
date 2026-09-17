@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -350,15 +351,27 @@ class PassivePlanner:
         self.max_loss_pct = max_loss_pct
 
     def plan(self, log_fn=None) -> PassivePlan:
-        """Full plan from scratch. Blocking ~30 sec."""
+        """Full plan from scratch.
+
+        Tries the LLM first with a hard timeout. If the LLM fails (timeout,
+        500, etc.) falls back INSTANTLY to rule-based logic — no blocking,
+        no retry, no waiting.
+        """
         _log = log_fn or (lambda m, l="INFO": print(f"[{l}] {m}"))
         _log("📊 Fetching full market data for passive plan…", "INFO")
 
         market_str, raw = build_market_data(self.budget)
+        spot  = raw.get('spot', 0)
+        pcr   = raw.get('pcr', 0)
+        vix   = raw.get('vix', 0)
+        atm   = raw.get('atm', 0)
+        expiry = raw.get('expiry', 'N/A')
+        ce_walls = raw.get('ce_walls', [])
+        pe_walls = raw.get('pe_walls', [])
 
         _log(
-            f"Market: spot={raw.get('spot',0)}  ATM={raw.get('atm',0)}  "
-            f"PCR={raw.get('pcr',0)}  sentiment={raw.get('sentiment','?')}",
+            f"Market: spot={spot}  ATM={atm}  "
+            f"PCR={pcr}  VIX={vix}  sentiment={raw.get('sentiment','?')}",
             "OK",
         )
 
@@ -371,8 +384,17 @@ class PassivePlanner:
         )
 
         _log("🧠 LLM building trade plan…", "INFO")
-        response = self._call_llm(prompt)
-        plan     = self._parse_response(response, raw)
+        llm_response = self._call_llm(prompt)
+
+        if llm_response and llm_response.strip():
+            _log("✓ LLM plan received", "OK")
+            plan = self._parse_response(llm_response, raw)
+        else:
+            _log(
+                "⚠ LLM unavailable — falling back to rule-based plan INSTANTLY",
+                "WARN",
+            )
+            plan = self._rule_based_plan(raw)
 
         _log(
             f"✓ Plan v{plan.version}: {len(plan.trades)} trades  "
@@ -388,6 +410,7 @@ class PassivePlanner:
         """
         Async refresh — re-plans with fresh data.
         Preserves open trades (they are NOT cancelled — only future entries updated).
+        Falls back to rules instantly if LLM fails.
         """
         _log = log_fn or (lambda m, l="INFO": print(f"[{l}] {m}"))
         _log("🔄 Async plan refresh — fetching fresh market data…", "INFO")
@@ -410,8 +433,19 @@ class PassivePlanner:
             max_loss_rs  = self.budget * self.max_loss_pct / 100,
         )
 
-        response  = self._call_llm(prompt)
-        new_plan  = self._parse_response(response, raw)
+        _log("🧠 LLM refreshing plan…", "INFO")
+        llm_response = self._call_llm(prompt)
+
+        if llm_response and llm_response.strip():
+            _log("✓ LLM refresh received", "OK")
+            new_plan = self._parse_response(llm_response, raw)
+        else:
+            _log(
+                "⚠ LLM unavailable during refresh — rule-based plan INSTANTLY",
+                "WARN",
+            )
+            new_plan = self._rule_based_plan(raw)
+
         new_plan.version = existing_plan.version + 1
 
         _log(
@@ -424,19 +458,147 @@ class PassivePlanner:
     # ── LLM call ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str) -> str:
-        """Single LLM call — returns raw text response."""
+        """Single LLM call — returns raw text response.
+
+        Uses a hard timeout (FAST_MODEL_TIMEOUT from config) so a stalled
+        NVIDIA NIM endpoint never blocks the trade execution path.
+        On timeout or 500/502/503: returns empty string so the caller
+        falls back to rule-based logic instantly.
+        """
+        import requests as _requests
         from agent import Session
-        from agent import FinalAnswerEvent, ErrorEvent
+        from agent import FinalAnswerEvent
+        from config import FAST_MODEL_TIMEOUT
         temp = Session()
         text = ""
         try:
+            # Run the agent with an overall request budget so a broken/stream-
+            # silent model cannot hang the planning thread.
+            _start = time.monotonic()
             for event in self.agent.run(prompt, temp):
                 if isinstance(event, FinalAnswerEvent):
                     text = event.text
                     break
+                # Hard cut: if we have spent longer than FAST_MODEL_TIMEOUT,
+                # bail out — the rule-based fallback will take over.
+                if time.monotonic() - _start > FAST_MODEL_TIMEOUT:
+                    log.warning("LLM plan call exceeded %ss — aborting for fallback",
+                                FAST_MODEL_TIMEOUT)
+                    break
+        except _requests.Timeout:
+            log.warning("LLM plan call timed out (%ss) — falling back to rules",
+                        FAST_MODEL_TIMEOUT)
         except Exception as exc:
-            log.error("Planner LLM call failed: %s", exc)
+            msg = str(exc)
+            if any(k in msg for k in ("500", "502", "503", "504", "timeout", "timed out")):
+                log.warning("LLM plan call failed (%s) — falling back to rules", msg[:120])
+            else:
+                log.error("Planner LLM call failed: %s", exc)
         return text
+
+    # ── Rule-based fallback plan ───────────────────────────────────────────────
+
+    def _rule_based_plan(self, raw: dict) -> PassivePlan:
+        """Instant rule-based plan when LLM is unavailable.
+
+        Uses FallbackEngine to generate actions from PCR/VIX/spot/OI data.
+        Produces a PassivePlan with the same schema so the executor never
+        needs to know the plan came from rules instead of the LLM.
+        """
+        from trading.rules_fallback import FallbackEngine
+
+        spot   = raw.get('spot', 0.0)
+        pcr    = raw.get('pcr', 0.0)
+        vix    = raw.get('vix', 0.0)
+        atm    = raw.get('atm', 0)
+        expiry = raw.get('expiry', 'N/A')
+        df     = raw.get('df')
+
+        ce_walls = []
+        pe_walls = []
+        if df is not None:
+            try:
+                ce_walls = [
+                    int(r.Strike)
+                    for _, r in df.nlargest(3, "CE_OI").iterrows()
+                ]
+                pe_walls = [
+                    int(r.Strike)
+                    for _, r in df.nlargest(3, "PE_OI").iterrows()
+                ]
+            except Exception:
+                pass
+
+        fb = FallbackEngine(iv=raw.get('vix', 15.0) or 15.0,
+                            minutes_to_expiry=375)
+        decision = fb.decide(
+            spot=spot,
+            pcr=pcr,
+            vix=vix,
+            expiry=expiry,
+            atm=atm,
+            ce_walls=ce_walls,
+            pe_walls=pe_walls,
+            budget=self.budget,
+            direction=self.direction,
+            max_loss_pct=self.max_loss_pct,
+            open_positions=0,
+        )
+
+        trades = []
+        for i, fa in enumerate(decision.actions, 1):
+            try:
+                trades.append(PlannedTrade(
+                    id            = str(i),
+                    expiry        = fa.expiry or expiry,
+                    strike        = fa.strike,
+                    option_type   = fa.option_type,
+                    action        = fa.action,
+                    qty           = fa.qty,
+                    entry_min     = fa.entry_price * 0.95,
+                    entry_max     = fa.entry_price * 1.05,
+                    entry_ideal   = fa.entry_price,
+                    sl            = fa.sl,
+                    sl_reason     = f"[RULES] {fa.rationale}",
+                    target1       = fa.target * 0.8,
+                    target2       = fa.target,
+                    target_reason = f"[RULES] {fa.rationale}",
+                    rationale     = fa.rationale,
+                    priority      = i,
+                    scenario      = "ALL",
+                    condition     = "Enter at market (rule-based fallback)",
+                ))
+            except Exception as e:
+                log.warning("Rule-based trade construction failed: %s", e)
+
+        bias_map = {"BULLISH": "BULLISH", "BEARISH": "BEARISH"}
+        return PassivePlan(
+            created_at       = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            expiry           = expiry,
+            spot             = spot,
+            atm              = atm,
+            pcr              = pcr,
+            vix              = vix,
+            sentiment        = "RULES_FALLBACK" if not decision.actions else
+                               ("BULLISH" if decision.regime == "DIRECTIONAL" and
+                                any(a.action == "BUY" and a.option_type == "CE" for a in decision.actions)
+                                else "BEARISH" if decision.regime == "DIRECTIONAL"
+                                else "NEUTRAL"),
+            max_pain         = raw.get('max_pain', 0),
+            trades           = trades,
+            scenarios        = {
+                "bull":    "Rule-based: PCR suggests bullish bias — CE buys favoured." if decision.regime == "DIRECTIONAL" else
+                           "Rule-based: sideways — premium selling preferred.",
+                "bear":    "Rule-based: PCR suggests bearish bias — PE buys favoured." if decision.regime == "DIRECTIONAL" else
+                           "Rule-based: sideways — premium selling preferred.",
+                "sideways": "Rule-based: VIX/pcr indicate range — sell OTM strangle if VIX<13, else hold.",
+            },
+            refresh_triggers = ["LLM recovered — re-plan with AI",
+                                "Spot moves > 100 pts",
+                                "PCR changes by > 0.3"],
+            overall_bias     = decision.regime if decision.regime != "NO_TRADE" else "NEUTRAL",
+            plan_note        = f"[RULES] PCR={pcr:.2f} VIX={vix:.1f} — LLM unavailable, rule-based plan (source: {decision.source})",
+        )
 
     # ── Response parser ────────────────────────────────────────────────────────
 

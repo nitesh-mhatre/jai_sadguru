@@ -67,6 +67,16 @@ NVIDIA_MODELS: dict[str, dict] = {
     # stream=False is REQUIRED: with stream=True + tools this model returns
     # either HTTP 500 or a stream that never emits a finish chunk (the client
     # would sit there until the request timeout).
+    "llama-vision": {
+        "model_id":    "meta/llama-3.2-11b-vision-instruct",
+        "api_key":     NVIDIA_KEYS["key5"],
+        "max_tokens":  512,
+        "temperature": 1.0,
+        "top_p":       1.0,
+        "stream":      False,
+        "timeout":     120,   # 2 min hard cutoff — drop connection if no response
+        "description": "Llama 3.2 11B Vision — fast model (DEFAULT for decisions)",
+    },
     "mistral": {
         "model_id":    "mistralai/mistral-nemotron",
         "api_key":     NVIDIA_KEYS["key5"],
@@ -75,7 +85,7 @@ NVIDIA_MODELS: dict[str, dict] = {
         "top_p":       0.7,
         "stream":      False,
         "timeout":     90,
-        "description": "Mistral Nemotron — fastest tool-calling model (DEFAULT)",
+        "description": "Mistral Nemotron — fastest tool-calling model (fallback)",
     },
     "nemo-light": {
         "model_id":    "nvidia/nemotron-3.5-lightning-30b-a3b",
@@ -118,7 +128,7 @@ NVIDIA_MODELS: dict[str, dict] = {
 }
 
 # Models used by the multi-model voting layer (order matters — first is chair)
-VOTING_MODELS = ["mistral", "nemo-light"]
+VOTING_MODELS = ["llama-vision", "mistral", "nemo-light"]
 
 # Default model short name.
 # Live-tested Sep 2026 with key5:
@@ -129,10 +139,10 @@ VOTING_MODELS = ["mistral", "nemo-light"]
 #   RETIRED (HTTP 410 Gone): minimax-m2.7, qwen3-next-80b,
 #                            step-3.5-flash, glm-5.2, kimi-k2.6
 #   nvidia/nemotron-3-super-120b-a12b returns 500/503 constantly
-NVIDIA_DEFAULT_MODEL = "mistral"
+NVIDIA_DEFAULT_MODEL = "llama-vision"
 
 # Automatic failover target when the active model errors out
-NVIDIA_FAILOVER_MODEL = "nemo-light"
+NVIDIA_FAILOVER_MODEL = "mistral"
 
 # Legacy aliases used elsewhere in codebase
 NVIDIA_MODEL       = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["model_id"]
@@ -140,6 +150,11 @@ NVIDIA_API_KEY     = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["api_key"]
 NVIDIA_MAX_TOKENS  = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["max_tokens"]
 NVIDIA_TEMPERATURE = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["temperature"]
 NVIDIA_TOP_P       = NVIDIA_MODELS[NVIDIA_DEFAULT_MODEL]["top_p"]
+
+# ── Fast model timeout override (applies to all LLM calls in trading loop) ──
+# Per the trading risk policy: never let an LLM call block the execution path
+# for more than 2 minutes. Even the fastest models can stall on this endpoint.
+FAST_MODEL_TIMEOUT = 120.0   # seconds — 2 min hard cutoff
 
 # ── NVIDIA Kumo — structured-data relational model (optional signals) ─────────
 # Endpoint used by trading/kumo_signals.py (binary classification on tabular

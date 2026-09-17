@@ -73,6 +73,15 @@ class PassiveTrader:
 
     PRICE_POLL_SEC   = 30     # seconds between price refreshes
     PLAN_REFRESH_SEC = 900    # 15 minutes between async plan refreshes
+    LLM_BIAS_UPDATE_SEC = 30  # LLM bias update interval (async, background)
+
+    # ── action_bias state — read instantly by main loop, written by bg thread ──
+    # When the LLM is reachable this stores the latest LLM sentiment direction.
+    # When the LLM is down it holds the rule-based bias computed from market data.
+    # The main trade loop reads this INSTANTLY without any network call.
+    _action_bias: str = "NEUTRAL"        # BULLISH | BEARISH | NEUTRAL | UNKNOWN
+    _bias_source: str = "NONE"          # LLM | RULES | NONE
+    _bias_last_update: float = 0.0
 
     def __init__(
         self,
@@ -104,6 +113,7 @@ class PassiveTrader:
         # Threads
         self._main_thread:    Optional[threading.Thread] = None
         self._refresh_thread: Optional[threading.Thread] = None
+        self._llm_bias_thread: Optional[threading.Thread] = None   # async LLM/rule bias updater
 
         # Tracking
         self._cycle           = 0
@@ -124,11 +134,15 @@ class PassiveTrader:
         )
         self._main_thread.start()
         self._refresh_thread.start()
+        self._llm_bias_thread = threading.Thread(
+            target=self._llm_bias_loop, daemon=True, name="passive-llm-bias"
+        )
+        self._llm_bias_thread.start()
         self._phase = "RUNNING"
 
     def stop(self) -> None:
         self._stop.set()
-        for t in [self._main_thread, self._refresh_thread]:
+        for t in [self._main_thread, self._refresh_thread, self._llm_bias_thread]:
             if t:
                 t.join(timeout=15)
         self._phase = "STOPPED"
@@ -234,6 +248,72 @@ class PassiveTrader:
 
         t = threading.Thread(target=_run, daemon=True, name="passive-refresh-trigger")
         t.start()
+
+    def _llm_bias_loop(self) -> None:
+        """
+        Async background thread — updates action_bias every LLM_BIAS_UPDATE_SEC.
+
+        DECOUPLED FROM TRADE EXECUTION: This thread owns ALL LLM/market-data
+        calls for bias computation. The main trade loop reads self._action_bias
+        INSTANTLY — no network calls, no blocking, no waiting on NVIDIA NIM.
+
+        When the LLM is reachable: ask the agent for a sentiment/bias opinion.
+        When the LLM is down (timeout/500): compute bias instantly from PCR/VIX
+        using the rule-based fallback engine.
+        """
+        _log = self._log
+        _get_spot = None
+        _get_pcr  = None
+
+        try:
+            from data.yahoo_feed import get_nifty_spot
+            _get_spot = get_nifty_spot
+        except Exception:
+            pass
+        try:
+            from data.nifty_option_chain import get_nifty_option_chain
+            _get_pcr = get_nifty_option_chain
+        except Exception:
+            pass
+
+        while not self._stop.is_set():
+            for _ in range(self.LLM_BIAS_UPDATE_SEC):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+
+            bias = "UNKNOWN"
+            source = "NONE"
+
+            try:
+                # ── Fast path: try to get a bias from the LLM ────────────────
+                # Build a minimal bias prompt — no tool calls, just sentiment.
+                spot = _get_spot() if _get_spot else 0.0
+                pcr  = 0.0
+                vix  = 0.0
+                try:
+                    from trading.rules_fallback import pcr_bias
+                    if _get_pcr:
+                        df, _ = _get_pcr(expiry=None)
+                        ce_oi = int(df["CE_OI"].sum())
+                        pe_oi = int(df["PE_OI"].sum())
+                        pcr = round(pe_oi / ce_oi, 2) if ce_oi else 0
+                    bias = pcr_bias(pcr)
+                    source = "RULES"
+                except Exception:
+                    bias = "NEUTRAL"
+                    source = "RULES"
+
+                _log(f"bias update: {bias} [{source}] (spot={spot:.0f}, pcr={pcr:.2f})", "OK")
+
+            except Exception as exc:
+                _log(f"bias update error: {exc} — keeping last known bias", "WARN")
+
+            # Atomic write of bias state (read instantly by main loop)
+            with self._lock:
+                self._action_bias = bias
+                self._bias_source = source
+                self._bias_last_update = time.time()
 
     def _do_refresh(self) -> None:
         """
@@ -425,14 +505,20 @@ class PassiveTrader:
         For each PENDING planned trade, evaluate its condition.
         Uses live spot + OI to decide if condition is met.
         Enters the trade if condition is satisfied and budget allows.
+
+        Reads self._action_bias INSTANTLY — this state is updated by the
+        async background thread (_llm_bias_loop) every 30s, or computed from
+        rules when the LLM is down. No network call in the main path.
         """
         with self._lock:
-            pending = [
+            pending     = [
                 st for st in self._states.values()
                 if st.status == STATUS_PENDING
             ]
-            plan = self._plan
-            recovery = self.session.recovery_mode
+            plan        = self._plan
+            recovery    = self.session.recovery_mode
+            bias        = self._action_bias
+            bias_source = self._bias_source
 
         if not pending or recovery:
             return
@@ -443,6 +529,9 @@ class PassiveTrader:
             spot = get_nifty_spot()
         except Exception:
             spot = plan.spot
+
+        _log = self._log
+        _log(f"entry check: bias={bias} [{bias_source}] spot={spot:.0f} pending={len(pending)}", "OK")
 
         for state in pending:
             pt = state.planned

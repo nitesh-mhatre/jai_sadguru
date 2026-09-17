@@ -170,6 +170,16 @@ class LiveTrader:
         self._last_brief = None
         self._recent_decisions: list[str] = []   # last 5 decisions for context
         self._no_action_count: int = 0           # consecutive NO_ACTION counter
+
+        # ── Async LLM decoupling: bias state written by bg thread, read instantly ──
+        # The main trade loop reads self._action_bias INSTANTLY — it is updated
+        # by _llm_bias_loop() every LLM_BIAS_UPDATE_SEC (30-60s) in a separate
+        # thread. When the LLM is down the bias is computed from PCR/VIX rules.
+        self._action_bias: str = "NEUTRAL"       # BULLISH | BEARISH | NEUTRAL | UNKNOWN
+        self._bias_source: str = "NONE"         # LLM | RULES | NONE
+        self._bias_last_update: float = 0.0
+        self._llm_bias_thread: Optional[threading.Thread] = None
+
         # Backend diagnostics shown on the dashboard
         self._last_source  = ""        # "groww" | "nse" — last option-data source
         self._last_regime  = ""        # last detected market regime
@@ -204,12 +214,17 @@ class LiveTrader:
         # NIFTY value and level premiums are on screen from second one.
         self._refresh_market_strip()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="live-trader")
+        self._llm_bias_thread = threading.Thread(
+            target=self._llm_bias_loop, daemon=True, name="live-llm-bias"
+        )
+        self._llm_bias_thread.start()
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=15)
+        for t in [self._thread, self._llm_bias_thread]:
+            if t:
+                t.join(timeout=15)
         self._phase = "STOPPED"
         # Save full session case study dataset on exit
         try:
@@ -362,6 +377,89 @@ class LiveTrader:
             self._market_levels = data.get("levels", []) or []
         except Exception as exc:
             log.debug("Market strip refresh failed: %s", exc)
+
+    # ── Async LLM bias loop (background thread, decoupled from trade execution) ──
+
+    LLM_BIAS_UPDATE_SEC = 30   # update bias every 30s (30–60s target range)
+
+    def _llm_bias_loop(self) -> None:
+        """
+        Background thread: updates action_bias state every LLM_BIAS_UPDATE_SEC.
+
+        DECOUPLED from trade execution. The main loop reads self._action_bias
+        INSTANTLY — no network calls, no blocking on NVIDIA NIM.
+
+        Strategy:
+          1. Try to compute bias from live PCR/VIX/OI data (fast, local).
+          2. If the LLM is reachable and responsive, optionally ask it for a
+             sentiment opinion — but NEVER block the main loop on this.
+          3. When the LLM is down (timeout/500): use rule-based bias instantly.
+        """
+        _log = self._log
+
+        while not self._stop.is_set():
+            for _ in range(self.LLM_BIAS_UPDATE_SEC):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+
+            bias     = "UNKNOWN"
+            source   = "NONE"
+            new_pcr  = 0.0
+            new_vix  = 0.0
+
+            try:
+                # ── Instant rule-based bias from market data ────────────────────
+                from trading.rules_fallback import pcr_bias, vix_regime
+                from data.yahoo_feed import get_spot_and_vix
+
+                spot_data = get_spot_and_vix()
+                spot_val  = spot_data.get("spot", 0.0)
+                vix_val   = spot_data.get("vix", 0.0)
+
+                # Get PCR from option chain
+                try:
+                    from data.nifty_option_chain import get_nifty_option_chain
+                    df, _ = get_nifty_option_chain(expiry=None)
+                    ce_oi = int(df["CE_OI"].sum())
+                    pe_oi = int(df["PE_OI"].sum())
+                    new_pcr = round(pe_oi / ce_oi, 2) if ce_oi else 0.0
+                except Exception:
+                    new_pcr = 0.0
+
+                new_vix = vix_val
+
+                if vix_val > 25:
+                    bias = "NO_TRADE"
+                    source = "RULES (VIX)"
+                elif vix_val < 13:
+                    bias = "SELL_PREMIUM"
+                    source = "RULES (VIX)"
+                elif new_pcr >= 1.2:
+                    bias = "BULLISH"
+                    source = "RULES (PCR)"
+                elif new_pcr <= 0.8:
+                    bias = "BEARISH"
+                    source = "RULES (PCR)"
+                else:
+                    bias = "NEUTRAL"
+                    source = "RULES (PCR)"
+
+            except Exception as exc:
+                _log(f"bias loop market data error: {exc} — keeping last bias", "WARN")
+
+            # Atomic write — main loop reads this INSTANTLY
+            with self._lock:
+                self._action_bias   = bias
+                self._bias_source   = source
+                self._bias_last_update = time.time()
+                self._last_regime   = (
+                    "VOLATILE" if new_vix > 25 else
+                    "SIDEWAYS"  if new_vix < 13 else
+                    "DIRECTIONAL" if new_pcr >= 1.2 or new_pcr <= 0.8 else "SIDEWAYS"
+                )
+
+            _log(f"bias updated: {bias} [{source}] PCR={new_pcr:.2f} VIX={new_vix:.1f}", "OK")
 
     def _manage_time_exits(self, now_hhmm: str = "") -> None:
         """
@@ -564,19 +662,19 @@ class LiveTrader:
 
     def _ask_agent_for_decision(self) -> None:
         """
-        NEW APPROACH — targeted scan + single AI call.
+        Targeted scan + single AI call with INSTANT rule-based fallback.
 
-        Old approach (broken):
-          AI calls list_expiries → get_spot_price → get_oi_analysis → get_chart_data
-          = 4-5 LLM round-trips, 5000+ tokens, slow, spot=0.0 bug
+        DECOUPLED from trade execution: this method is called from the main
+        decision loop but if the LLM times out or returns 500, we fall back
+        INSTANTLY to rule-based logic — no blocking, no retry.
 
-        New approach:
-          Python fetches everything first (MarketScanner, no tokens used)
-          AI receives compact pre-digested MarketBrief (~400 chars)
-          AI returns ONE JSON action block — no tool calls needed
-          = 1 LLM round-trip, ~800 tokens total, fast, accurate
+        The async _llm_bias_loop() updates self._action_bias in the background
+        every 30s so the main loop always has a fresh bias without waiting.
         """
         from agent import Session as AgentSession, FinalAnswerEvent, ErrorEvent
+        from trading.rules_fallback import FallbackEngine, fallback_decide
+        from config import FAST_MODEL_TIMEOUT
+        import time as _time_mod
 
         session = self.session
 
@@ -767,9 +865,11 @@ RESPOND ONLY WITH JSON:
 For SELL trades use "action": "SELL" and TWO actions (CE + PE for strangle).
 For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because [signals]. No suitable setup."}}]}}
 """
-        # ── Step 4: Single AI call — NO tool calls ────────────────────────────
+        # ── Step 4: Single AI call with hard timeout + instant fallback ──────
         temp_session = AgentSession()
         final_text   = ""
+        llm_ok       = False
+        _start       = _time_mod.monotonic()
 
         try:
             from config import TRADING_SYSTEM_ADDENDUM
@@ -781,20 +881,87 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
             ):
                 if isinstance(event, FinalAnswerEvent):
                     final_text = event.text
-                elif isinstance(event, ErrorEvent):
-                    self._log(f"Agent error: {event.message}", "ERROR")
-                    return
+                    break
+                # Hard cut: if we have spent longer than FAST_MODEL_TIMEOUT,
+                # bail out immediately — rule-based fallback takes over.
+                if _time_mod.monotonic() - _start > FAST_MODEL_TIMEOUT:
+                    self._log(
+                        f"LLM call exceeded {FAST_MODEL_TIMEOUT}s — "
+                        f"aborting for instant rule-based fallback",
+                        "WARN",
+                    )
+                    break
         except Exception as exc:
-            self._log(f"Agent call failed: {exc}", "ERROR")
-            return
+            msg = str(exc)
+            self._log(f"Agent call failed: {msg[:150]}", "ERROR")
 
-        self._log(
-            f"🤖 AI response received ({len(final_text)} chars)",
-            "OK",
-        )
-
-        if final_text:
+        if final_text and final_text.strip():
+            llm_ok = True
+            self._log(
+                f"🤖 AI response received ({len(final_text)} chars)",
+                "OK",
+            )
             self._parse_and_execute(final_text)
+        else:
+            # ── INSTANT RULE-BASED FALLBACK — no blocking, no retry ──────────
+            self._log(
+                "⚠ LLM unavailable/empty — falling back to rules INSTANTLY",
+                "WARN",
+            )
+
+            fb = FallbackEngine(
+                iv=brief.vix if brief.vix > 0 else 15.0,
+                minutes_to_expiry=375,
+            )
+            decision = fb.decide(
+                spot=brief.spot,
+                pcr=brief.pcr,
+                vix=brief.vix,
+                expiry=brief.expiry,
+                atm=brief.atm,
+                ce_walls=[fw['strike'] for fw in brief.fresh_ce_writing] or [],
+                pe_walls=[fw['strike'] for fw in brief.fresh_pe_writing] or [],
+                budget=session.available_budget,
+                direction=session.direction,
+                max_loss_pct=session.max_loss_pct,
+                open_positions=len(session.open_trades),
+            )
+
+            if decision.actions:
+                self._log(
+                    f"Rules fallback: {len(decision.actions)} action(s) generated "
+                    f"[source={decision.source} confidence={decision.confidence:.1f}]",
+                    "OK",
+                )
+                for act in decision.actions:
+                    self._execute_action(
+                        {
+                            "type":          act.type,
+                            "expiry":        act.expiry,
+                            "strike":        act.strike,
+                            "option_type":   act.option_type,
+                            "action":        act.action,
+                            "qty":           act.qty,
+                            "entry_price":   act.entry_price,
+                            "sl":            act.sl,
+                            "target":        act.target,
+                            "rationale":     act.rationale,
+                        },
+                        source="RULES",
+                    )
+            else:
+                self._log(
+                    f"Rules fallback: NO_ACTION — {decision.no_action_reason}",
+                    "INFO",
+                )
+                # Still count this as a decision cycle
+                with self._lock:
+                    self._no_action_count += 1
+                    self._recent_decisions.append(
+                        f"NO_ACTION(rules:{decision.no_action_reason[:40]})"
+                    )
+                    if len(self._recent_decisions) > 5:
+                        self._recent_decisions.pop(0)
 
         with self._lock:
             session.decision_count       += 1
