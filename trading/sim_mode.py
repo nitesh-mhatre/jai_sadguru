@@ -675,8 +675,10 @@ class SimTrader:
         from_llm=False means the direction did NOT come from the model — it was
         derived from price momentum because the LLM was unavailable/unparseable.
 
-        Uses FAST_MODEL_TIMEOUT (2 min) hard cutoff. On timeout or 500/502/503
-        the connection is cut immediately and the rule-based fallback is used.
+        Uses MULTI-MODEL async voting: llama-vision + mistral + nemo-light fire
+        in PARALLEL. Majority vote wins. If all fail or timeout → fallback.
+
+        Timeout: capped at FAST_MODEL_TIMEOUT (120s) overall.
         """
         import time as _time_mod
         from config import FAST_MODEL_TIMEOUT
@@ -701,39 +703,40 @@ recent momentum (closed candles): {momentum}
 Vote on the NEXT cycle direction. Reply ONLY with JSON:
 {{"direction": "BULLISH|BEARISH|SIDEWAYS", "reason": "≤12 words citing data above"}}"""
 
-        from agent import Session, FinalAnswerEvent, ErrorEvent, extract_json
-        temp = Session()
-        _start = _time_mod.monotonic()
+        # ── Multi-model async vote ────────────────────────────────────────────
         try:
-            for ev in self.agent.run(prompt, temp,
-                                     system_suffix="Reply only with the JSON vote."):
-                if isinstance(ev, FinalAnswerEvent):
-                    data = extract_json(ev.text) or {}
-                    d = str(data.get("direction", "")).upper()
-                    if d in ("BULLISH", "BEARISH", "SIDEWAYS"):
+            from trading.async_llm import LLMPool, sync_vote_all
+
+            vote = sync_vote_all(
+                pool=None,
+                prompt=prompt,
+                system_suffix="Reply only with the JSON vote.",
+            )
+
+            if vote.is_clear and vote.direction in ("BULLISH", "BEARISH", "SIDEWAYS"):
+                self._llm_fail_streak = 0
+                reason = f"multi-model vote: {vote.agreement_count}/{vote.total_models} agreed [{vote.direction}]"
+                self._log(f"LLM vote: {vote.direction} ({vote.confidence:.0%} agreement, "
+                          f"{vote.agreement_count}/{vote.total_models} models)", "OK")
+                return vote.direction, reason[:60], True
+
+            # No clear majority — use fastest model's response if available
+            if vote.model_votes:
+                for name, direction in vote.model_votes.items():
+                    if direction in ("BULLISH", "BEARISH", "SIDEWAYS"):
                         self._llm_fail_streak = 0
-                        return d, str(data.get("reason", ""))[:60], True
-                    self._llm_fail_streak += 1
-                    return (self._fallback_direction(momentum),
-                            "unparseable LLM vote — momentum fallback", False)
-                elif isinstance(ev, ErrorEvent):
-                    self._llm_fail_streak += 1
-                    if self._llm_fail_streak == 3:
-                        self._log("LLM failing repeatedly — switching to momentum-only votes", "WARN")
-                    return (self._fallback_direction(momentum),
-                            f"LLM FAILED ({ev.message[:40]}) — momentum fallback", False)
-                # Hard timeout cut — do NOT wait for the LLM beyond 2 min
-                if _time_mod.monotonic() - _start > FAST_MODEL_TIMEOUT:
-                    self._llm_fail_streak += 1
-                    self._log("LLM vote timed out (%ss) — momentum fallback", "WARN",
-                              FAST_MODEL_TIMEOUT)
-                    return (self._fallback_direction(momentum),
-                            "LLM timeout — momentum fallback", False)
+                        self._log(f"LLM vote: {direction} (from {name}, no clear majority)", "WARN")
+                        return direction, f"single model vote ({name})", True
+
+            self._llm_fail_streak += 1
+            self._log("LLM vote: no valid responses — momentum fallback", "WARN")
+            return (self._fallback_direction(momentum),
+                    "LLM no valid vote — momentum fallback", False)
+
         except Exception as exc:
             self._llm_fail_streak += 1
-            log.warning("LLM vote failed: %s", exc)
+            log.warning("Multi-model LLM vote failed: %s", exc)
             return self._fallback_direction(momentum), f"LLM exception: {exc}", False
-        return self._fallback_direction(momentum), "no LLM response", False
 
     def _fallback_direction(self, momentum: str) -> str:
         m = momentum.lower()

@@ -180,6 +180,25 @@ def _choose_expiry() -> str:
     return raw if raw else (current or expiries[0])
 
 
+def _choose_direction() -> str:
+    """Ask the user whether to allow BUY only, SELL only, or both sides."""
+    ui.console.print()
+    ui.console.print("  [bold color(208)]📊 Trading direction[/bold color(208)]  "
+                     "[dim](press Enter for both sides)[/dim]")
+    ui.console.print("    [bold]1[/bold]  ⚡ [dim]Both BUY & SELL (default)[/dim]")
+    ui.console.print("    [bold]2[/bold]  🟢 [dim]BUY only (long positions)[/dim]")
+    ui.console.print("    [bold]3[/bold]  🔴 [dim]SELL only (short positions)[/dim]")
+    try:
+        raw = input("  direction ❯ ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return "BOTH"
+    if raw in ("2", "buy", "b"):
+        return "BUY"
+    if raw in ("3", "sell", "s"):
+        return "SELL"
+    return "BOTH"
+
+
 def _choose_levels(spot: float) -> list[dict]:
     """
     Ask the user to select 2–4 strike levels to track.
@@ -689,6 +708,7 @@ def run(config: Config, start_mode: str = "chat") -> None:
     mode   = start_mode or _choose_mode()
     expiry = ""
     levels: list[dict] = []
+    direction = "BOTH"
     if mode in ("live", "simulation"):
         expiry = _choose_expiry()
         from data.groww_feed import get_option_chain_snapshot
@@ -696,15 +716,21 @@ def run(config: Config, start_mode: str = "chat") -> None:
         with ui.console.status("[dim]Fetching option chain snapshot…[/dim]", spinner="dots2"):
             snap = get_option_chain_snapshot(expiry)
         levels = _choose_levels(float(snap.get("spot") or 0))
+        direction = _choose_direction()
         # Show the CURRENT NIFTY value + the current premium/OI/IV of every
         # chosen level before the mode starts, so the user can see what they
         # are about to trade (refresh any time with /levels).
         ui.show_market_now(expiry, levels, title="Your tracked levels — current values")
         if mode == "live":
-            _run_live_mode("budget is 100000 and loss taking capacity is 10 percent only",
-                           agent, config, expiry=expiry, levels=levels)
+            _run_live_mode(
+                f"{'only buy ' if direction == 'BUY' else 'only sell ' if direction == 'SELL' else ''}budget is 100000 and loss taking capacity is 10 percent only",
+                agent, config, expiry=expiry, levels=levels
+            )
         else:
-            _run_sim_mode("7d", agent, config, expiry=expiry, levels=levels)
+            _run_sim_mode(
+                f"{'only buy ' if direction == 'BUY' else 'only sell ' if direction == 'SELL' else ''}7d",
+                agent, config, expiry=expiry, levels=levels
+            )
 
     while True:
         try:

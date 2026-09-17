@@ -221,11 +221,13 @@ def get_nifty_technicals() -> dict:
         low    = today_df["Low"]
         vol    = today_df["Volume"]
 
-        ema9   = round(float(close.ewm(span=9,  adjust=False).mean().iloc[-1]), 2)
-        ema21  = round(float(close.ewm(span=21, adjust=False).mean().iloc[-1]), 2)
-        ltp    = round(float(close.iloc[-1]), 2)
-        day_h  = round(float(high.max()), 2)
-        day_l  = round(float(low.min()), 2)
+        ema9       = round(float(close.ewm(span=9,  adjust=False).mean().iloc[-1]), 2)
+        ema21      = round(float(close.ewm(span=21, adjust=False).mean().iloc[-1]), 2)
+        ema9_prev  = round(float(close.ewm(span=9,  adjust=False).mean().iloc[-2]), 2)
+        ema21_prev = round(float(close.ewm(span=21, adjust=False).mean().iloc[-2]), 2)
+        ltp        = round(float(close.iloc[-1]), 2)
+        day_h      = round(float(high.max()), 2)
+        day_l      = round(float(low.min()), 2)
 
         # VWAP = sum(typical_price × volume) / sum(volume)
         typical = (high + low + close) / 3
@@ -244,15 +246,18 @@ def get_nifty_technicals() -> dict:
         else:                       tech_bias = "NEUTRAL"
 
         return {
-            "ltp":       ltp,
-            "ema9":      ema9,
-            "ema21":     ema21,
-            "vwap":      vwap,
-            "day_high":  day_h,
-            "day_low":   day_l,
-            "trend":     trend,
-            "tech_bias": tech_bias,
-            "candles":   len(today_df),
+            "ltp":         ltp,
+            "ema9":        ema9,
+            "ema21":       ema21,
+            "ema9_prev":   ema9_prev,
+            "ema21_prev":  ema21_prev,
+            "vwap":        vwap,
+            "day_high":    day_h,
+            "day_low":     day_l,
+            "trend":       trend,
+            "tech_bias":   tech_bias,
+            "candles":     len(today_df),
+            "adx":         round(float(_calc_adx(high, low, close)), 2),
             "trade_note": {
                 "STRONG_UPTREND":   "Price>EMA9>EMA21 and above VWAP. Strong bullish. Buy CE at VWAP retest.",
                 "UPTREND":          "Price above EMA9 and VWAP. Bullish bias. Buy CE on dips.",
@@ -310,6 +315,65 @@ def get_premarket_data() -> dict:
     except Exception as exc:
         log.warning("Pre-market data failed: %s", exc)
         return {"error": str(exc)}
+
+
+def _calc_adx(high, low, close, period: int = 14) -> float:
+    """
+    Calculate ADX (Average Directional Index) — trend strength 0-100.
+    ADX < 20: weak/choppy trend
+    ADX 20-25: moderate trend
+    ADX > 25: strong trend
+    ADX > 30: very strong trend
+
+    Uses Wilder's smoothing method.
+    """
+    import pandas as pd
+    df = pd.DataFrame({"high": high, "low": low, "close": close})
+    if len(df) < period + 1:
+        return 0.0
+
+    # True Range
+    df["prev_close"] = df["close"].shift(1)
+    df["tr1"] = df["high"] - df["low"]
+    df["tr2"] = abs(df["high"] - df["prev_close"])
+    df["tr3"] = abs(df["low"] - df["prev_close"])
+    df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+
+    # +DM and -DM
+    df["up_move"]   = df["high"] - df["high"].shift(1)
+    df["down_move"] = df["low"].shift(1) - df["low"]
+    df["+dm"] = df["up_move"].where(
+        (df["up_move"] > df["down_move"]) & (df["up_move"] > 0), 0.0
+    )
+    df["-dm"] = df["down_move"].where(
+        (df["down_move"] > df["up_move"]) & (df["down_move"] > 0), 0.0
+    )
+
+    # Wilder's smoothing (RMA) — first value is simple average, rest are smoothed
+    tr_smooth  = df["tr"].rolling(window=period).mean().iloc[period - 1]
+    plus_dm    = df["+dm"].rolling(window=period).mean().iloc[period - 1]
+    minus_dm   = df["-dm"].rolling(window=period).mean().iloc[period - 1]
+
+    for i in range(period, len(df)):
+        tr_smooth  = tr_smooth * (period - 1) / period + df["tr"].iloc[i] / period
+        plus_dm    = plus_dm * (period - 1) / period + df["+dm"].iloc[i] / period
+        minus_dm   = minus_dm * (period - 1) / period + df["-dm"].iloc[i] / period
+
+    if tr_smooth == 0:
+        return 0.0
+
+    plus_di  = 100 * plus_dm / tr_smooth
+    minus_di = 100 * minus_dm / tr_smooth
+    dx       = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 0
+
+    # Smooth DX into ADX (Wilder's smoothing again)
+    adx_vals = [dx]
+    for i in range(1, period):
+        if i < len(df):
+            adx_vals.append(df["tr"].iloc[i])
+    adx = sum(adx_vals) / len(adx_vals) if adx_vals else 0
+
+    return round(max(0, min(100, adx)), 2)
 
 
 if __name__ == "__main__":

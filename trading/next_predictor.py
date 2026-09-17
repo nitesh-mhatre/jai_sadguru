@@ -518,22 +518,88 @@ def _score_max_pain(spot: float, max_pain: int, expiry: str) -> SignalScore:
 
 
 def _score_technicals(tech: dict) -> SignalScore:
-    """Weight 10%."""
-    if not tech or "error" in tech:
-        return SignalScore("EMA/VWAP", "unavail", 50, 0.10, "Intraday data unavailable")
-    trend = tech.get("trend", "UNKNOWN")
-    ema9  = tech.get("ema9", 0)
-    ema21 = tech.get("ema21", 0)
-    vwap  = tech.get("vwap", 0)
-    ltp   = tech.get("ltp", 0)
+    """Weight 15% (raised from 10%).
 
-    if   trend == "STRONG_UPTREND":   s, n = 85, f"Price>EMA9({ema9:.0f})>EMA21({ema21:.0f}) above VWAP({vwap:.0f})"
-    elif trend == "UPTREND":          s, n = 67, f"Price above EMA9 and VWAP → bullish"
-    elif trend == "SIDEWAYS":         s, n = 50, f"EMA9≈EMA21, price near VWAP → choppy"
-    elif trend == "DOWNTREND":        s, n = 33, f"Price below EMA9 and VWAP → bearish"
-    elif trend == "STRONG_DOWNTREND": s, n = 15, f"Price<EMA9({ema9:.0f})<EMA21({ema21:.0f}) below VWAP({vwap:.0f})"
-    else:                             s, n = 50, "Trend unknown"
-    return SignalScore("EMA/VWAP Trend", f"{trend}", s, 0.10, n)
+    Enhanced with:
+      • EMA crossover detection (EMA9 × EMA21 cross)
+      • ADX trend strength (ADX < 20 = sideways/choppy, ADX > 25 = trending)
+      • Price position vs EMA stack (bullish alignment vs bearish)
+      • VWAP slope (rising/falling/flat)
+    """
+    if not tech or "error" in tech:
+        return SignalScore("EMA/VWAP", "unavail", 50, 0.15, "Intraday data unavailable")
+    trend     = tech.get("trend", "UNKNOWN")
+    ema9      = tech.get("ema9", 0)
+    ema21     = tech.get("ema21", 0)
+    vwap      = tech.get("vwap", 0)
+    ltp       = tech.get("ltp", 0)
+    adx       = tech.get("adx", 0)          # ADX trend strength 0-100
+    ema9_prev = tech.get("ema9_prev", 0)    # previous EMA9 for crossover
+    ema21_prev = tech.get("ema21_prev", 0)  # previous EMA21 for crossover
+
+    # ── EMA crossover signals ────────────────────────────────────────────────
+    ema_cross = 0  # +1 = bullish cross, -1 = bearish cross, 0 = none
+    if ema9_prev and ema21_prev:
+        if ema9_prev <= ema21_prev and ema9 > ema21:
+            ema_cross = 1   # golden cross
+        elif ema9_prev >= ema21_prev and ema9 < ema21:
+            ema_cross = -1  # death cross
+
+    # ── ADX trend strength filter ────────────────────────────────────────────
+    # ADX < 20 = ranging/choppy (LOW confidence in direction)
+    # ADX 20-25 = weak trend
+    # ADX > 25 = strong trend (high confidence)
+    adx_str = ""
+    adx_factor = 1.0
+    if adx > 0:
+        if adx < 18:
+            adx_str = f"ADX={adx:.1f} (very weak — CHOPPY)"
+            adx_factor = 0.4  # discount all trend signals in choppy market
+        elif adx < 25:
+            adx_str = f"ADX={adx:.1f} (weak trend)"
+            adx_factor = 0.7
+        else:
+            adx_str = f"ADX={adx:.1f} (strong trend)"
+            adx_factor = 1.2  # boost trend signals
+
+    # ── Combined score ────────────────────────────────────────────────────────
+    base_score = 50
+    if   trend == "STRONG_UPTREND":
+        base_score = 88
+        n = f"Price>EMA9({ema9:.0f})>EMA21({ema21:.0f}) above VWAP({vwap:.0f})"
+    elif trend == "UPTREND":
+        base_score = 70
+        n = f"Price above EMA9 & VWAP, EMA9>EMA21"
+    elif trend == "SIDEWAYS":
+        base_score = 48 if adx < 20 else 55
+        n = f"EMA9≈EMA21, price near VWAP → {'choppy' if adx < 20 else 'mild drift'}"
+    elif trend == "DOWNTREND":
+        base_score = 30
+        n = f"Price below EMA9 & VWAP, EMA9<EMA21"
+    elif trend == "STRONG_DOWNTREND":
+        base_score = 12
+        n = f"Price<EMA9({ema9:.0f})<EMA21({ema21:.0f}) below VWAP({vwap:.0f})"
+    else:
+        base_score = 50
+        n = "Trend unknown"
+
+    # EMA crossover bonus/penalty (strong signal)
+    if ema_cross == 1:
+        base_score = min(95, base_score + 12)
+        n += f" | GOLDEN CROSS (EMA9×EMA21)"
+    elif ema_cross == -1:
+        base_score = max(5, base_score - 12)
+        n += f" | DEATH CROSS (EMA9×EMA21)"
+
+    # Apply ADX factor
+    base_score = 50 + (base_score - 50) * adx_factor
+    base_score = max(5, min(95, base_score))
+
+    if adx_str:
+        n += f" | {adx_str}"
+
+    return SignalScore("EMA/ADX/VWAP", f"{trend} {adx_str}".strip(),
+                       round(base_score), 0.15, n)
 
 
 def _score_vix(vix_data: dict) -> SignalScore:
@@ -628,20 +694,68 @@ def _score_time_of_day() -> SignalScore:
     return SignalScore("Time of Day", now.strftime("%H:%M"), s, 0.04, n)
 
 
-def _score_range_tightness(range_width: float, vix: float) -> SignalScore:
+def _score_range_tightness(range_width: float, vix: float,
+                           vix_history: list | None = None) -> SignalScore:
     """
-    Weight 3%. Tight OI range + low VIX = sideways confirmation.
-    Score 50 = sideways. Score away from 50 = directional.
+    Weight 5% (raised from 3%).
+
+    Volatility contraction/expansion detection:
+      • Tight OI walls + low VIX + tight range = sideways/choppy → avoid strangles
+      • Expanding range + rising VIX = breakdown/breakout → directional play
+      • Price near range edge = breakout attempt (fading vs riding depends on context)
+
+    When ADX is low AND range is tight AND VIX is low → definitely sideways.
     """
     if range_width <= 0:
-        return SignalScore("Range Width", "N/A", 50, 0.03, "Range data unavailable")
-    # Tight range → score near 50 (sideways)
-    # Wide range → score away from 50 based on VIX direction
-    if   range_width <= 150: s, n = 50, f"Range {range_width:.0f}pts — very tight, sideways"
-    elif range_width <= 250: s, n = 50, f"Range {range_width:.0f}pts — tight, sideways"
-    elif range_width <= 400: s, n = 52, f"Range {range_width:.0f}pts — moderate, slight direction possible"
-    else:                    s, n = 55, f"Range {range_width:.0f}pts — wide, breakout territory"
-    return SignalScore("Range Width", f"{range_width:.0f}pts", s, 0.03, n)
+        return SignalScore("Range/Vol", "N/A", 50, 0.05, "Range data unavailable")
+
+    # Determine if market is in contraction (squeeze) or expansion
+    vix_trend = "unknown"
+    if vix_history and len(vix_history) >= 2:
+        vix_1d_ago = vix_history[0].get("vix", 0) if vix_history else 0
+        if vix_1d_ago > 0:
+            vix_chg = (vix - vix_1d_ago) / vix_1d_ago * 100
+            if vix_chg > 5:
+                vix_trend = "rising_faste
+            elif vix_chg > 2:
+                vix_trend = "rising"
+            elif vix_chg < -5:
+                vix_trend = "falling_faste
+            elif vix_chg < -2:
+                vix_trend = "falling"
+
+    # Score logic:
+    # Very tight range (< 200 pts) + low VIX (< 14) = classic sideways/ranging
+    #   → score stays near 50, but we add a "SIDEWAYS_TRAP" flag
+    # Wide range (> 400 pts) = directional/breakout → score moves away from 50
+    #   based on which side the spot is
+
+    sideways_confidence = 0
+    if range_width <= 180 and vix < 14:
+        s, n = 50, (f"Range {range_width:.0f}pts + VIX {vix} — "
+                    f"CLASSIC SIDEWAYS/RANGE-bound. "
+                    f"⚠ STRANGLE risky — whipsaw zone. "
+                    f"Prefer NO_TRADE or wait for breakout.")
+        sideways_confidence = 0.85  # high confidence it's sideways
+    elif range_width <= 250 and vix < 16:
+        s = 50
+        n = f"Range {range_width:.0f}pts, VIX {vix} — moderately tight, possible range"
+    elif range_width <= 400:
+        # Moderate range — slight directional lean based on spot position
+        s = 52
+        n = f"Range {range_width:.0f}pts — moderate, breakout possible"
+    else:
+        # Wide range — breakout territory, lean toward directional
+        s = 55
+        n = f"Range {range_width:.0f}pts — WIDE, expect directional move"
+
+    if vix_trend and vix_trend.startswith("rising"):
+        n += f" | VIX rising {vix_trend} → expansion likely"
+    elif vix_trend and vix_trend.startswith("falling"):
+        n += f" | VIX falling {vix_trend} → contraction/continuation"
+
+    return SignalScore("Range/Vol Contraction", f"{range_width:.0f}pts VIX={vix}",
+                       s, 0.05, n)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -780,7 +894,7 @@ def predict_next(budget: float = 50_000.0) -> NextTrade:
         # Group B — Price Structure (30%)
         _score_oi_wall_proximity(oc["spot"], oc["ce_wall"], oc["pe_wall"]),
         _score_max_pain(oc["spot"], oc["max_pain"], oc["expiry"]),
-        _score_technicals(tech),
+        _score_technicals(tech),   # now includes EMA crossover + ADX
         # Group C — Volatility Context (20%)
         _score_vix(vix_data),
         _score_iv_skew(oc["avg_ce_iv"], oc["avg_pe_iv"]),
@@ -788,7 +902,8 @@ def predict_next(budget: float = 50_000.0) -> NextTrade:
         # Group D — External Cues (15%)
         _score_global(gd),
         _score_time_of_day(),
-        _score_range_tightness(oc["range_width"], vix_val),
+        _score_range_tightness(oc["range_width"], vix_val,
+                               vix_history=vix_data.get("history", [])),
     ]
 
     # Verify weights sum to 1.0
@@ -805,6 +920,16 @@ def predict_next(budget: float = 50_000.0) -> NextTrade:
     # VIX override
     if vix_val > 25 and regime == "SIDEWAYS":
         regime = "BEARISH"   # extreme fear breaks range
+
+    # ── SIDEWAYS_TRAP detection (avoid strangles in choppy markets) ──────────
+    # When ADX < 18 (very weak trend) AND range < 200 pts AND VIX < 14:
+    # the market is genuinely sideways — strangles WILL get stopped out.
+    # Mark regime as SIDEWAYS_TRAP to suppress premium-selling.
+    tech_data = tech if tech and "error" not in tech else {}
+    adx_val   = tech_data.get("adx", 0)
+    range_w   = oc["range_width"]
+    if adx_val < 18 and range_w < 200 and vix_val < 14:
+        regime = "SIDEWAYS_TRAP"   # special flag: do NOT sell strangles here
 
     # ── Signal agreement count ────────────────────────────────────────────────
     bull_sig = sum(1 for s in signals if s.score > 58)

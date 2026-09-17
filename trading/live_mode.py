@@ -865,47 +865,45 @@ RESPOND ONLY WITH JSON:
 For SELL trades use "action": "SELL" and TWO actions (CE + PE for strangle).
 For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because [signals]. No suitable setup."}}]}}
 """
-        # ── Step 4: Single AI call with hard timeout + instant fallback ──────
-        temp_session = AgentSession()
-        final_text   = ""
-        llm_ok       = False
-        _start       = _time_mod.monotonic()
-
+        # ── Step 4: Multi-model async LLM with vote aggregation + fallback ──
+        # Fire llama-vision + mistral + nemo-light in PARALLEL.
+        # The fastest model's response is used; if all fail → rules fallback.
+        # This is NON-BLOCKING for the trade loop — the bias thread keeps running.
         try:
-            from config import TRADING_SYSTEM_ADDENDUM
-            from trading.market_regime import REGIME_TRADING_RULES
-            # temp_session is fresh every cycle — no stale history accumulates
-            for event in self.agent.run(
-                prompt, temp_session,
-                system_suffix = TRADING_SYSTEM_ADDENDUM + REGIME_TRADING_RULES,
-            ):
-                if isinstance(event, FinalAnswerEvent):
-                    final_text = event.text
-                    break
-                # Hard cut: if we have spent longer than FAST_MODEL_TIMEOUT,
-                # bail out immediately — rule-based fallback takes over.
-                if _time_mod.monotonic() - _start > FAST_MODEL_TIMEOUT:
-                    self._log(
-                        f"LLM call exceeded {FAST_MODEL_TIMEOUT}s — "
-                        f"aborting for instant rule-based fallback",
-                        "WARN",
-                    )
-                    break
+            from trading.async_llm import LLMPool, sync_query_with_fallback, sync_vote_all
+            from config import TRADING_SYSTEM_ADDENDUM, REGIME_TRADING_RULES
+
+            # Build the full prompt with system suffix for the LLM pool
+            full_prompt = prompt
+            system_suffix = TRADING_SYSTEM_ADDENDUM + REGIME_TRADING_RULES
+
+            # ── Option A: query with fallback chain (fastest first) ───────────
+            # This fires llama-vision first (fastest), then falls back to
+            # mistral, then nemo-light if needed — all async.
+            llm_result = sync_query_with_fallback(
+                pool=None,  # will create fresh pool for this call
+                prompt=full_prompt,
+                system_suffix=system_suffix,
+            )
+
+            if llm_result.success and llm_result.response_text.strip():
+                final_text = llm_result.response_text
+                self._log(
+                    f"🤖 {llm_result.model_name} responded in {llm_result.elapsed:.1f}s "
+                    f"({len(final_text)} chars)",
+                    "OK",
+                )
+                self._parse_and_execute(final_text)
+            else:
+                raise Exception(f"{llm_result.model_name} failed: {llm_result.error}")
+
         except Exception as exc:
             msg = str(exc)
-            self._log(f"Agent call failed: {msg[:150]}", "ERROR")
+            self._log(f"Multi-model LLM call failed: {msg[:150]}", "ERROR")
 
-        if final_text and final_text.strip():
-            llm_ok = True
-            self._log(
-                f"🤖 AI response received ({len(final_text)} chars)",
-                "OK",
-            )
-            self._parse_and_execute(final_text)
-        else:
             # ── INSTANT RULE-BASED FALLBACK — no blocking, no retry ──────────
             self._log(
-                "⚠ LLM unavailable/empty — falling back to rules INSTANTLY",
+                "⚠ LLM unavailable — falling back to rules INSTANTLY",
                 "WARN",
             )
 
@@ -929,8 +927,7 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
 
             if decision.actions:
                 self._log(
-                    f"Rules fallback: {len(decision.actions)} action(s) generated "
-                    f"[source={decision.source} confidence={decision.confidence:.1f}]",
+                    f"Rules fallback: {len(decision.actions)} action(s) [src={decision.source}]",
                     "OK",
                 )
                 for act in decision.actions:
@@ -954,7 +951,6 @@ For NO_ACTION: {{"actions": [{{"type": "NO_ACTION", "reason": "REGIME=X because 
                     f"Rules fallback: NO_ACTION — {decision.no_action_reason}",
                     "INFO",
                 )
-                # Still count this as a decision cycle
                 with self._lock:
                     self._no_action_count += 1
                     self._recent_decisions.append(

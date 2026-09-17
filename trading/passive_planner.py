@@ -458,43 +458,37 @@ class PassivePlanner:
     # ── LLM call ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str) -> str:
-        """Single LLM call — returns raw text response.
+        """Multi-model async LLM call with fallback — returns raw text response.
 
-        Uses a hard timeout (FAST_MODEL_TIMEOUT from config) so a stalled
-        NVIDIA NIM endpoint never blocks the trade execution path.
-        On timeout or 500/502/503: returns empty string so the caller
-        falls back to rule-based logic instantly.
+        Uses LLMPool to fire llama-vision + mistral + nemo-light in PARALLEL.
+        The fastest model's response is returned. If all fail → empty string
+        so the caller falls back to rule-based logic instantly.
+
+        Timeout: capped at FAST_MODEL_TIMEOUT (120s) overall.
         """
-        import requests as _requests
-        from agent import Session
-        from agent import FinalAnswerEvent
+        from trading.async_llm import sync_query_with_fallback
         from config import FAST_MODEL_TIMEOUT
-        temp = Session()
-        text = ""
+
         try:
-            # Run the agent with an overall request budget so a broken/stream-
-            # silent model cannot hang the planning thread.
-            _start = time.monotonic()
-            for event in self.agent.run(prompt, temp):
-                if isinstance(event, FinalAnswerEvent):
-                    text = event.text
-                    break
-                # Hard cut: if we have spent longer than FAST_MODEL_TIMEOUT,
-                # bail out — the rule-based fallback will take over.
-                if time.monotonic() - _start > FAST_MODEL_TIMEOUT:
-                    log.warning("LLM plan call exceeded %ss — aborting for fallback",
-                                FAST_MODEL_TIMEOUT)
-                    break
-        except _requests.Timeout:
-            log.warning("LLM plan call timed out (%ss) — falling back to rules",
-                        FAST_MODEL_TIMEOUT)
+            result = sync_query_with_fallback(
+                pool=None,  # fresh pool per call
+                prompt=prompt,
+                system_suffix="",
+            )
+            if result.success and result.response_text.strip():
+                log.info("%s responded in %.1fs — using result",
+                         result.model_name, result.elapsed)
+                return result.response_text
+            else:
+                log.warning("All models failed: %s", result.error[:120])
+                return ""
         except Exception as exc:
             msg = str(exc)
             if any(k in msg for k in ("500", "502", "503", "504", "timeout", "timed out")):
                 log.warning("LLM plan call failed (%s) — falling back to rules", msg[:120])
             else:
                 log.error("Planner LLM call failed: %s", exc)
-        return text
+            return ""
 
     # ── Rule-based fallback plan ───────────────────────────────────────────────
 
